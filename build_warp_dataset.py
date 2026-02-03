@@ -314,7 +314,7 @@ def list_scene_dirs(input_dir: Path) -> list[Path]:
 
 
 def load_model(device: torch.device) -> VGGT:
-    model = VGGT.from_pretrained("facebook/VGGT-1B").to(device)
+    model = VGGT.from_pretrained("facebook/VGGT-1B-Commercial").to(device)
     model.eval()
     return model
 
