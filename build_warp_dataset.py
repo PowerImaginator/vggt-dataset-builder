@@ -49,7 +49,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--preprocess-mode",
         type=str,
-        default="pad",
+        default="crop",
         choices=["crop", "pad"],
         help="Preprocessing mode used before VGGT inference (default: crop).",
     )
@@ -453,7 +453,10 @@ def restore_map_to_original_resolution(
             fill_value,
             dtype=map_tensor.dtype,
         )
-        canvas[:, :, int(meta["crop_top"]) :, :] = map_tensor
+        crop_top = int(meta["crop_top"])
+        cropped_height = map_tensor.shape[2]
+        cropped_width = map_tensor.shape[3]
+        canvas[:, :, crop_top : crop_top + cropped_height, :cropped_width] = map_tensor
         map_tensor = canvas
 
     map_tensor = torch_nn.interpolate(
@@ -609,6 +612,12 @@ def main() -> None:
 
         scene_output_dir = output_dir / scene_dir.name
         scene_output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Skip if output folder already contains output files
+        existing_outputs = list(scene_output_dir.glob("*_splats.png"))
+        if existing_outputs:
+            print(f"Skipping {scene_dir.name}: output folder already contains {len(existing_outputs)} output file(s).")
+            continue
 
         if auto_skip_note is not None:
             print(
