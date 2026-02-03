@@ -1,7 +1,11 @@
 import argparse
 import json
 import shutil
+import sys
 from pathlib import Path
+
+# Add the vggt submodule to the path so its internal imports work
+sys.path.insert(0, str(Path(__file__).parent / "vggt"))
 
 import numpy as np
 import torch
@@ -37,7 +41,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--preprocess-mode",
         type=str,
-        default="crop",
+        default="pad",
         choices=["crop", "pad"],
         help="Preprocessing mode used before VGGT inference (default: crop).",
     )
@@ -314,7 +318,7 @@ def list_scene_dirs(input_dir: Path) -> list[Path]:
 
 
 def load_model(device: torch.device) -> VGGT:
-    model = VGGT.from_pretrained("facebook/VGGT-1B-Commercial").to(device)
+    model = VGGT.from_pretrained("facebook/VGGT-1B").to(device)
     model.eval()
     return model
 

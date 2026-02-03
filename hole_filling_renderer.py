@@ -285,13 +285,11 @@ class HoleFillingRenderer:
     def _quad_vao(self, program: moderngl.Program) -> moderngl.VertexArray:
         key = program.glo
         if key not in self._quad_vaos:
-            self._quad_vaos[key] = self.ctx.vertex_array(
-                program,
-                [
-                    (self._quad_pos_buffer, "2f", "a_position"),
-                    (self._quad_tex_buffer, "2f", "a_tex_coord"),
-                ],
-            )
+            # Build attribute list dynamically - some shaders may optimize out unused attributes
+            content = [(self._quad_pos_buffer, "2f", "a_position")]
+            if "a_tex_coord" in program:
+                content.append((self._quad_tex_buffer, "2f", "a_tex_coord"))
+            self._quad_vaos[key] = self.ctx.vertex_array(program, content)
         return self._quad_vaos[key]
 
     def _render_points_pass(
