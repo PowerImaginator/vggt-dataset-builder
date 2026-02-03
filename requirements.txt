@@ -7,3 +7,4 @@
 # Additional dependencies for dataset builder
 moderngl
 glcontext
+pillow-heif

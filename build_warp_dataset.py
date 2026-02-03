@@ -12,6 +12,14 @@ import torch
 import torch.nn.functional as torch_nn
 from PIL import Image
 
+# Register HEIF/HEIC support with PIL
+try:
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+    HEIF_SUPPORTED = True
+except ImportError:
+    HEIF_SUPPORTED = False
+
 from vggt.models.vggt import VGGT
 from vggt.utils.geometry import unproject_depth_map_to_point_map
 from vggt.utils.load_fn import load_and_preprocess_images
@@ -19,7 +27,7 @@ from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 from hole_filling_renderer import HoleFillingRenderer
 
 
-SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".heic", ".heif"}
 
 
 def parse_args() -> argparse.Namespace:
