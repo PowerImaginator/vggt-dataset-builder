@@ -49,7 +49,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--preprocess-mode",
         type=str,
-        default="crop",
+        default="pad",
         choices=["crop", "pad"],
         help="Preprocessing mode used before VGGT inference (default: crop).",
     )
@@ -122,6 +122,11 @@ def parse_args() -> argparse.Namespace:
         "--auto-s0",
         action="store_true",
         help=("Estimate s0 per frame from depth and intrinsics (default: off)."),
+    )
+    parser.add_argument(
+        "--no-confidence",
+        action="store_true",
+        help=("Do not save the depth confidence map (default: saves confidence)."),
     )
     parser.add_argument(
         "--limit",
@@ -362,8 +367,13 @@ def build_preprocess_metadata(
             pad_left = (target_size - resized_width) // 2
             pad_top = (target_size - resized_height) // 2
             crop_top = 0
+            # Content dimensions (before padding to target_size)
             effective_width = resized_width
             effective_height = resized_height
+            # In pad mode, all images are padded to target_size x target_size,
+            # so model space dimensions equal target_size
+            model_space_height = target_size
+            model_space_width = target_size
         else:
             resized_width = target_size
             resized_height = round(height * (resized_width / width) / 14) * 14
@@ -374,8 +384,11 @@ def build_preprocess_metadata(
             pad_top = 0
             effective_width = resized_width
             effective_height = min(resized_height, target_size)
+            # In crop mode, model space dimensions equal effective dimensions
+            model_space_height = effective_height
+            model_space_width = effective_width
 
-        effective_sizes.append((effective_height, effective_width))
+        effective_sizes.append((model_space_height, model_space_width))
         metas.append(
             {
                 "orig_width": width,
@@ -389,6 +402,8 @@ def build_preprocess_metadata(
                 "effective_height": effective_height,
                 "resized_width": resized_width,
                 "resized_height": resized_height,
+                "model_space_width": model_space_width,
+                "model_space_height": model_space_height,
             }
         )
 
@@ -396,8 +411,8 @@ def build_preprocess_metadata(
     max_width = max(model_width, max(w for _, w in effective_sizes))
 
     for meta in metas:
-        extra_pad_top = (max_height - meta["effective_height"]) // 2
-        extra_pad_left = (max_width - meta["effective_width"]) // 2
+        extra_pad_top = (max_height - meta["model_space_height"]) // 2
+        extra_pad_left = (max_width - meta["model_space_width"]) // 2
         meta["total_pad_top"] = meta["pad_top"] + extra_pad_top
         meta["total_pad_left"] = meta["pad_left"] + extra_pad_left
         meta["model_height"] = max_height
@@ -790,6 +805,37 @@ def main() -> None:
             reference_path = scene_output_dir / f"{next_name}_reference.png"
 
             Image.fromarray(splats_image).save(splats_path)
+
+            if not args.no_confidence:
+                # Save confidence map for the source frame (idx) as grayscale
+                conf_for_save = conf_frame.copy()
+                # Normalize to 0-255 range
+                conf_min = conf_for_save.min()
+                conf_max = conf_for_save.max()
+                if conf_max > conf_min:
+                    conf_normalized = (conf_for_save - conf_min) / (conf_max - conf_min)
+                else:
+                    conf_normalized = np.zeros_like(conf_for_save)
+                conf_uint8 = (conf_normalized * 255).astype(np.uint8)
+                if not args.upsample_depth and resize_size is None:
+                    # Restore to original resolution
+                    conf_image = Image.fromarray(conf_uint8, mode="L")
+                    meta = preprocess_metas[idx]
+                    left = int(meta["total_pad_left"])
+                    top = int(meta["total_pad_top"])
+                    right = left + int(meta["effective_width"])
+                    bottom = top + int(meta["effective_height"])
+                    conf_image = conf_image.crop((left, top, right, bottom))
+                    conf_image = conf_image.resize(
+                        (int(meta["orig_width"]), int(meta["orig_height"])),
+                        Image.Resampling.BICUBIC,
+                    )
+                else:
+                    conf_image = Image.fromarray(conf_uint8, mode="L")
+                    if resize_size is not None:
+                        conf_image = conf_image.resize(resize_size, Image.Resampling.BICUBIC)
+                conf_path = scene_output_dir / f"{next_name}_confidence.png"
+                conf_image.save(conf_path)
             target_image = Image.open(image_paths[next_idx])
             reference_image = Image.open(image_paths[idx])
             try:
