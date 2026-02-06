@@ -144,7 +144,63 @@ def parse_args() -> argparse.Namespace:
         choices=["jpg", "jpeg", "png"],
         help="Output image format (default: jpg).",
     )
+    parser.add_argument(
+        "--save-ply",
+        action="store_true",
+        help="Save point clouds as PLY files for the reference frames (default: off).",
+    )
     return parser.parse_args()
+
+
+def write_ply(
+    output_path: Path,
+    points: np.ndarray,
+    colors: np.ndarray,
+    confidences: np.ndarray | None = None,
+) -> None:
+    """Write point cloud to binary PLY file.
+    
+    Args:
+        output_path: Path to output PLY file
+        points: Nx3 array of 3D points
+        colors: Nx3 array of RGB colors (0-1 range)
+        confidences: Optional Nx1 array of confidence values
+    """
+    import struct
+    
+    num_points = points.shape[0]
+    
+    # Convert colors from 0-1 to 0-255 range
+    colors_uint8 = (colors * 255).astype(np.uint8)
+    
+    # Write header as text
+    header = "ply\n"
+    header += "format binary_little_endian 1.0\n"
+    header += f"element vertex {num_points}\n"
+    header += "property float x\n"
+    header += "property float y\n"
+    header += "property float z\n"
+    header += "property uchar red\n"
+    header += "property uchar green\n"
+    header += "property uchar blue\n"
+    if confidences is not None:
+        header += "property float confidence\n"
+    header += "end_header\n"
+    
+    with open(output_path, 'wb') as f:
+        # Write header
+        f.write(header.encode('ascii'))
+        
+        # Write vertex data in binary
+        for i in range(num_points):
+            x, y, z = points[i]
+            r, g, b = colors_uint8[i]
+            # Pack: 3 floats (x,y,z) + 3 unsigned chars (r,g,b)
+            data = struct.pack('fffBBB', x, y, z, r, g, b)
+            if confidences is not None:
+                # Add confidence as float
+                data += struct.pack('f', confidences[i])
+            f.write(data)
 
 
 def sorted_image_paths(input_dir: Path, skip_every: int) -> list[Path]:
@@ -969,9 +1025,15 @@ def main() -> None:
                 target_image.close()
                 reference_image.close()
 
+            # Save PLY file if requested
+            if args.save_ply:
+                ply_path = scene_output_dir / f"{next_name}_reference.ply"
+                write_ply(ply_path, points, colors, confidences if not args.no_confidence else None)
+            
+            ply_note = f" and {next_name}_reference.ply" if args.save_ply else ""
             print(
                 f"Wrote {scene_dir.name}/{splats_path.name}, {target_path.name}, "
-                f"and {reference_path.name}"
+                f"and {reference_path.name}{ply_note}"
             )
 
         del images

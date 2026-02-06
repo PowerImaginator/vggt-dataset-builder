@@ -58,6 +58,11 @@ For DL3DV datasets with automatic frame selection:
 uv run python build_warp_dataset.py --upsample-depth --auto-s0 --auto-skip --target-overlap 0.5 --limit 10
 ```
 
+Export point clouds for visualization:
+```bash
+uv run python build_warp_dataset.py --upsample-depth --auto-s0 --save-ply
+```
+
 ## Command-Line Options
 
 ### Input/Output
@@ -81,6 +86,7 @@ uv run python build_warp_dataset.py --upsample-depth --auto-s0 --auto-skip --tar
 - `--sigma <float>`: Gaussian splatting sigma parameter controlling splat size (default: 20.0)
 - `--auto-s0`: Automatically estimate per-frame Gaussian splat size (s0) from depth and intrinsics (disabled by default)
 - `--no-confidence`: Skip saving depth confidence maps (saves confidence by default)
+- `--save-ply`: Save point clouds as PLY files for reference frames (disabled by default). Creates viewable 3D point clouds with RGB colors and optional confidence values.
 
 ### Frame Selection
 - `--skip-every <int>`: Use every Nth image to increase view spacing (default: 1, uses all images)
@@ -111,7 +117,7 @@ Supported formats: `.jpg`, `.jpeg`, `.png`, `.bmp`, `.tif`, `.tiff`, `.heic`, `.
 
 ## Output Structure
 
-For each scene, generates triplets of images in `--output-dir`:
+For each scene, generates triplets (or quadruplets with `--save-ply`) of images in `--output-dir`:
 ```
 output/
   scene1/
@@ -119,7 +125,16 @@ output/
     image2_target.jpg      # Ground truth current view
     image2_reference.jpg   # Previous view (reference)
     image2_confidence.png  # Depth confidence map (if not --no-confidence)
+    image2_reference.ply   # Point cloud (if --save-ply)
 ```
+
+### PLY Files
+When `--save-ply` is enabled, point cloud files are saved in binary PLY format containing:
+- **Vertices**: 3D world coordinates (X, Y, Z) for each valid depth point
+- **Colors**: RGB values (0-255) from the reference image
+- **Confidence**: Depth confidence values (if not `--no-confidence`)
+
+Binary format provides ~80% smaller file sizes compared to ASCII. PLY files can be viewed in tools like MeshLab, CloudCompare, or Blender.
 
 ## Resolution Handling
 
