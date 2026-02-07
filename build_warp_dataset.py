@@ -1,12 +1,17 @@
 import argparse
 import json
 import shutil
+import sys
 from pathlib import Path
+
+# Add the vggt submodule to the path so its internal imports work
+sys.path.insert(0, str(Path(__file__).parent / "vggt"))
 
 import numpy as np
 import torch
 import torch.nn.functional as torch_nn
 from PIL import Image
+import pillow_heif
 
 from vggt.models.vggt import VGGT
 from vggt.utils.geometry import unproject_depth_map_to_point_map
@@ -14,8 +19,19 @@ from vggt.utils.load_fn import load_and_preprocess_images
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 from hole_filling_renderer import HoleFillingRenderer
 
+try:
+    import cv2
+    import onnxruntime
+    from vggt.visual_util import segment_sky, download_file_from_url
+    SKY_FILTER_AVAILABLE = True
+except ImportError:
+    SKY_FILTER_AVAILABLE = False
+    cv2 = None
+    onnxruntime = None
 
-SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+pillow_heif.register_heif_opener()
+
+SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".heic", ".heif"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -112,12 +128,164 @@ def parse_args() -> argparse.Namespace:
         help=("Estimate s0 per frame from depth and intrinsics (default: off)."),
     )
     parser.add_argument(
+        "--no-confidence",
+        action="store_true",
+        help=("Do not save the depth confidence map (default: saves confidence)."),
+    )
+    parser.add_argument(
         "--limit",
         type=int,
         default=0,
         help=("Limit to the first N images after filtering (default: 0, no limit)."),
     )
+    parser.add_argument(
+        "--max-megapixels",
+        type=float,
+        default=1.0,
+        help=(
+            "Maximum output resolution in megapixels when upsampling depth "
+            "(default: 1.0). Images exceeding this will be scaled down proportionally."
+        ),
+    )
+    parser.add_argument(
+        "--output-format",
+        type=str,
+        default="jpg",
+        choices=["jpg", "jpeg", "png"],
+        help="Output image format (default: jpg).",
+    )
+    parser.add_argument(
+        "--save-ply",
+        action="store_true",
+        help="Save point clouds as PLY files for the reference frames (default: off).",
+    )
+    parser.add_argument(
+        "--filter-sky",
+        action="store_true",
+        help="Filter sky points using segmentation model (requires onnxruntime, default: off).",
+    )
+    parser.add_argument(
+        "--filter-black-bg",
+        action="store_true",
+        help="Filter black background points (RGB sum < 16, default: off).",
+    )
+    parser.add_argument(
+        "--filter-white-bg",
+        action="store_true",
+        help="Filter white background points (RGB > 240, default: off).",
+    )
     return parser.parse_args()
+
+
+def write_ply(
+    output_path: Path,
+    points: np.ndarray,
+    colors: np.ndarray,
+    confidences: np.ndarray | None = None,
+) -> None:
+    """Write point cloud to binary PLY file.
+    
+    Args:
+        output_path: Path to output PLY file
+        points: Nx3 array of 3D points
+        colors: Nx3 array of RGB colors (0-1 range)
+        confidences: Optional Nx1 array of confidence values
+    """
+    import struct
+    
+    num_points = points.shape[0]
+    
+    # Convert colors from 0-1 to 0-255 range
+    colors_uint8 = (colors * 255).astype(np.uint8)
+    
+    # Write header as text
+    header = "ply\n"
+    header += "format binary_little_endian 1.0\n"
+    header += f"element vertex {num_points}\n"
+    header += "property float x\n"
+    header += "property float y\n"
+    header += "property float z\n"
+    header += "property uchar red\n"
+    header += "property uchar green\n"
+    header += "property uchar blue\n"
+    if confidences is not None:
+        header += "property float confidence\n"
+    header += "end_header\n"
+    
+    with open(output_path, 'wb') as f:
+        # Write header
+        f.write(header.encode('ascii'))
+        
+        # Write vertex data in binary
+        for i in range(num_points):
+            x, y, z = points[i]
+            r, g, b = colors_uint8[i]
+            # Pack: 3 floats (x,y,z) + 3 unsigned chars (r,g,b)
+            data = struct.pack('fffBBB', x, y, z, r, g, b)
+            if confidences is not None:
+                # Add confidence as float
+                data += struct.pack('f', confidences[i])
+            f.write(data)
+
+
+def apply_sky_filter(
+    conf_frame: np.ndarray,
+    image_path: Path,
+    skyseg_session,
+    sky_masks_dir: Path,
+) -> np.ndarray:
+    """Apply sky segmentation to filter confidence scores."""
+    if not SKY_FILTER_AVAILABLE:
+        print("Warning: Sky filtering requires opencv-python and onnxruntime. Skipping.")
+        return conf_frame
+    
+    sky_masks_dir.mkdir(parents=True, exist_ok=True)
+    image_name = image_path.name
+    mask_path = sky_masks_dir / image_name
+    
+    if mask_path.exists():
+        sky_mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+    else:
+        sky_mask = segment_sky(str(image_path), skyseg_session, str(mask_path))
+    
+    # Resize mask to match confidence map if needed
+    H, W = conf_frame.shape
+    if sky_mask.shape[0] != H or sky_mask.shape[1] != W:
+        sky_mask = cv2.resize(sky_mask, (W, H))
+    
+    # Apply mask (segment_sky returns 255 for non-sky, 0 for sky)
+    sky_mask_binary = (sky_mask > 128).astype(np.float32)
+    return conf_frame * sky_mask_binary
+
+
+def apply_background_filters(
+    colors: np.ndarray,
+    filter_black: bool,
+    filter_white: bool,
+) -> np.ndarray:
+    """Apply black and/or white background filtering.
+    
+    Args:
+        colors: Nx3 array of RGB colors (0-1 range)
+        filter_black: Filter black background
+        filter_white: Filter white background
+    
+    Returns:
+        Boolean mask of valid points
+    """
+    mask = np.ones(colors.shape[0], dtype=bool)
+    
+    if filter_black:
+        # Filter out black background (RGB sum < 16/255 in 0-1 range)
+        colors_255 = (colors * 255).astype(np.uint8)
+        mask &= (colors_255.sum(axis=1) >= 16)
+    
+    if filter_white:
+        # Filter out white background (all RGB > 240/255)
+        colors_255 = (colors * 255).astype(np.uint8)
+        mask &= ~((colors_255[:, 0] > 240) & (colors_255[:, 1] > 240) & (colors_255[:, 2] > 240))
+    
+    return mask
 
 
 def sorted_image_paths(input_dir: Path, skip_every: int) -> list[Path]:
@@ -135,6 +303,61 @@ def sorted_image_paths(input_dir: Path, skip_every: int) -> list[Path]:
     if len(image_paths) < 2:
         raise ValueError(f"Need at least two images after skipping in {input_dir}.")
     return image_paths
+
+
+def rescale_image_to_max_megapixels(
+    path: Path,
+    max_megapixels: float,
+    temp_dir: Path,
+) -> Path:
+    """Rescale image if it exceeds max megapixels, saving to temporary directory."""
+    if max_megapixels <= 0:
+        return path
+    with Image.open(path) as img:
+        if img.mode == "RGBA":
+            background = Image.new("RGBA", img.size, (255, 255, 255, 255))
+            img = Image.alpha_composite(background, img)
+        img = img.convert("RGB")
+        width, height = img.size
+        megapixels = (width * height) / 1_000_000
+        if megapixels <= max_megapixels:
+            return path
+        scale = (max_megapixels / megapixels) ** 0.5
+        new_width = max(1, int(round(width * scale)))
+        new_height = max(1, int(round(height * scale)))
+        if new_width == width and new_height == height:
+            return path
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        temp_path = temp_dir / f"{path.stem}_rescaled{path.suffix}"
+        resized = img.resize((new_width, new_height), Image.Resampling.BICUBIC)
+        resized.save(temp_path)
+        return temp_path
+
+
+def rescale_scene_images_to_max_megapixels(
+    image_paths: list[Path],
+    max_megapixels: float,
+    temp_dir: Path,
+) -> tuple[list[Path], str | None]:
+    """Rescale all images in a scene to max megapixels limit."""
+    if max_megapixels <= 0:
+        return image_paths, None
+    resized_paths: list[Path] = []
+    resized_count = 0
+    for path in image_paths:
+        resized_path = rescale_image_to_max_megapixels(
+            path, max_megapixels, temp_dir
+        )
+        if resized_path != path:
+            resized_count += 1
+        resized_paths.append(resized_path)
+    note = None
+    if resized_count > 0:
+        note = (
+            f"Rescaled {resized_count}/{len(image_paths)} images to "
+            f"<= {max_megapixels:.2f}MP (in-memory)"
+        )
+    return resized_paths, note
 
 
 def resolve_images_dir(scene_dir: Path) -> Path | None:
@@ -314,7 +537,7 @@ def list_scene_dirs(input_dir: Path) -> list[Path]:
 
 
 def load_model(device: torch.device) -> VGGT:
-    model = VGGT.from_pretrained("facebook/VGGT-1B-Commercial").to(device)
+    model = VGGT.from_pretrained("facebook/VGGT-1B").to(device)
     model.eval()
     return model
 
@@ -350,8 +573,13 @@ def build_preprocess_metadata(
             pad_left = (target_size - resized_width) // 2
             pad_top = (target_size - resized_height) // 2
             crop_top = 0
+            # Content dimensions (before padding to target_size)
             effective_width = resized_width
             effective_height = resized_height
+            # In pad mode, all images are padded to target_size x target_size,
+            # so model space dimensions equal target_size
+            model_space_height = target_size
+            model_space_width = target_size
         else:
             resized_width = target_size
             resized_height = round(height * (resized_width / width) / 14) * 14
@@ -362,8 +590,11 @@ def build_preprocess_metadata(
             pad_top = 0
             effective_width = resized_width
             effective_height = min(resized_height, target_size)
+            # In crop mode, model space dimensions equal effective dimensions
+            model_space_height = effective_height
+            model_space_width = effective_width
 
-        effective_sizes.append((effective_height, effective_width))
+        effective_sizes.append((model_space_height, model_space_width))
         metas.append(
             {
                 "orig_width": width,
@@ -377,6 +608,8 @@ def build_preprocess_metadata(
                 "effective_height": effective_height,
                 "resized_width": resized_width,
                 "resized_height": resized_height,
+                "model_space_width": model_space_width,
+                "model_space_height": model_space_height,
             }
         )
 
@@ -384,8 +617,8 @@ def build_preprocess_metadata(
     max_width = max(model_width, max(w for _, w in effective_sizes))
 
     for meta in metas:
-        extra_pad_top = (max_height - meta["effective_height"]) // 2
-        extra_pad_left = (max_width - meta["effective_width"]) // 2
+        extra_pad_top = (max_height - meta["model_space_height"]) // 2
+        extra_pad_left = (max_width - meta["model_space_width"]) // 2
         meta["total_pad_top"] = meta["pad_top"] + extra_pad_top
         meta["total_pad_left"] = meta["pad_left"] + extra_pad_left
         meta["model_height"] = max_height
@@ -441,7 +674,10 @@ def restore_map_to_original_resolution(
             fill_value,
             dtype=map_tensor.dtype,
         )
-        canvas[:, :, int(meta["crop_top"]) :, :] = map_tensor
+        crop_top = int(meta["crop_top"])
+        cropped_height = map_tensor.shape[2]
+        cropped_width = map_tensor.shape[3]
+        canvas[:, :, crop_top : crop_top + cropped_height, :cropped_width] = map_tensor
         map_tensor = canvas
 
     map_tensor = torch_nn.interpolate(
@@ -567,6 +803,16 @@ def main() -> None:
     resize_size = None
     if args.resize_width > 0 and args.resize_height > 0:
         resize_size = (args.resize_width, args.resize_height)
+        resize_megapixels = (resize_size[0] * resize_size[1]) / 1_000_000
+        if args.max_megapixels > 0 and resize_megapixels > args.max_megapixels:
+            scale = (args.max_megapixels / resize_megapixels) ** 0.5
+            resize_size = (
+                max(1, int(round(resize_size[0] * scale))),
+                max(1, int(round(resize_size[1] * scale))),
+            )
+            print(
+                f"Rescaling resize-size to honor max megapixels: {resize_size[0]}x{resize_size[1]}"
+            )
 
     scene_dirs = list_scene_dirs(input_dir)
     device_name = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -581,6 +827,23 @@ def main() -> None:
     renderer: HoleFillingRenderer | None = None
     renderer_size: tuple[int, int] | None = None
     shaders_dir = Path(__file__).resolve().parent / "shaders"
+    
+    # Initialize sky segmentation if needed
+    skyseg_session = None
+    if args.filter_sky:
+        if not SKY_FILTER_AVAILABLE:
+            print("Warning: --filter-sky requires opencv-python and onnxruntime. Install with:")
+            print("  uv pip install opencv-python onnxruntime")
+            print("Sky filtering will be disabled.")
+        else:
+            skyseg_path = Path("skyseg.onnx")
+            if not skyseg_path.exists():
+                print("Downloading sky segmentation model...")
+                download_file_from_url(
+                    "https://huggingface.co/JianyuanWang/skyseg/resolve/main/skyseg.onnx",
+                    "skyseg.onnx"
+                )
+            skyseg_session = onnxruntime.InferenceSession("skyseg.onnx")
 
     for scene_dir in scene_dirs:
         try:
@@ -598,11 +861,30 @@ def main() -> None:
         scene_output_dir = output_dir / scene_dir.name
         scene_output_dir.mkdir(parents=True, exist_ok=True)
 
+        # Skip if output folder already contains output files
+        output_ext = "jpg" if args.output_format in ["jpg", "jpeg"] else args.output_format
+        existing_outputs = list(scene_output_dir.glob(f"*_splats.{output_ext}"))
+        if existing_outputs:
+            print(f"Skipping {scene_dir.name}: output folder already contains {len(existing_outputs)} output file(s).")
+            continue
+
         if auto_skip_note is not None:
             print(
                 f"Auto skip for {scene_dir.name}: {auto_skip_note} "
                 f"(target overlap {args.target_overlap})."
             )
+        
+        # Create temporary directory for rescaled images (cleaned up later)
+        temp_resized_dir = None
+        if args.max_megapixels > 0:
+            import tempfile
+            temp_resized_dir = Path(tempfile.mkdtemp(prefix=f"rescale_{scene_dir.name}_"))
+            image_paths, resize_note = rescale_scene_images_to_max_megapixels(
+                image_paths, args.max_megapixels, temp_resized_dir
+            )
+            if resize_note is not None:
+                print(f"{scene_dir.name}: {resize_note}")
+        
         print(f"Loading {len(image_paths)} images from {scene_dir}...")
         images = load_and_preprocess_images(
             [str(path) for path in image_paths],
@@ -627,15 +909,39 @@ def main() -> None:
                     int(preprocess_metas[0]["orig_width"]),
                     int(preprocess_metas[0]["orig_height"]),
                 )
+                # Check if all images have the same resolution
+                mismatched_resolutions = False
                 for meta in preprocess_metas[1:]:
                     if (
                         int(meta["orig_width"]) != output_size[0]
                         or int(meta["orig_height"]) != output_size[1]
                     ):
-                        raise ValueError(
-                            "All images in a scene must share the same resolution to render "
-                            "high-res outputs."
-                        )
+                        mismatched_resolutions = True
+                        break
+                
+                # If resolutions don't match, use the minimum dimensions to avoid upscaling
+                if mismatched_resolutions:
+                    print(
+                        f"Images in {scene_dir.name} have different resolutions. "
+                        f"Using minimum dimensions for output size."
+                    )
+                    min_width = min(int(meta["orig_width"]) for meta in preprocess_metas)
+                    min_height = min(int(meta["orig_height"]) for meta in preprocess_metas)
+                    output_size = (min_width, min_height)
+            
+            # Apply megapixel limit
+            width, height = output_size
+            megapixels = (width * height) / 1_000_000
+            if megapixels > args.max_megapixels:
+                scale = (args.max_megapixels / megapixels) ** 0.5
+                width = int(width * scale)
+                height = int(height * scale)
+                output_size = (width, height)
+                print(
+                    f"Scaling output from {megapixels:.2f}MP to {args.max_megapixels:.2f}MP: "
+                    f"{output_size[0]}x{output_size[1]}"
+                )
+            
             render_width, render_height = output_size
         else:
             output_size = None
@@ -731,11 +1037,28 @@ def main() -> None:
                 depth_frame = depth_frame.squeeze(-1)
             if conf_frame.ndim == 3:
                 conf_frame = conf_frame.squeeze(-1)
+            
+            # Apply sky filtering if enabled
+            if args.filter_sky and skyseg_session is not None:
+                sky_masks_dir = scene_output_dir / "sky_masks"
+                conf_frame = apply_sky_filter(
+                    conf_frame, image_paths[idx], skyseg_session, sky_masks_dir
+                )
+            
             valid_mask = depth_frame > 1e-6
 
             points = world_points[idx][valid_mask]
             colors = images_np[idx][valid_mask]
             confidences = conf_frame[valid_mask]
+            
+            # Apply background filtering if enabled
+            if args.filter_black_bg or args.filter_white_bg:
+                bg_mask = apply_background_filters(
+                    colors, args.filter_black_bg, args.filter_white_bg
+                )
+                points = points[bg_mask]
+                colors = colors[bg_mask]
+                confidences = confidences[bg_mask]
 
             if args.auto_s0:
                 s0 = estimate_s0_from_depth(depth_frame, intrinsic[idx])
@@ -764,11 +1087,45 @@ def main() -> None:
                     model_render, preprocess_metas[next_idx], args.preprocess_mode
                 )
 
-            splats_path = scene_output_dir / f"{next_name}_splats.png"
-            target_path = scene_output_dir / f"{next_name}_target.png"
-            reference_path = scene_output_dir / f"{next_name}_reference.png"
+            output_ext = "jpg" if args.output_format in ["jpg", "jpeg"] else args.output_format
+            splats_path = scene_output_dir / f"{next_name}_splats.{output_ext}"
+            target_path = scene_output_dir / f"{next_name}_target.{output_ext}"
+            reference_path = scene_output_dir / f"{next_name}_reference.{output_ext}"
 
-            Image.fromarray(splats_image).save(splats_path)
+            save_kwargs = {"quality": 95, "optimize": True} if output_ext == "jpg" else {}
+            Image.fromarray(splats_image).save(splats_path, **save_kwargs)
+
+            if not args.no_confidence:
+                # Save confidence map for the source frame (idx) as grayscale
+                conf_for_save = conf_frame.copy()
+                # Normalize to 0-255 range
+                conf_min = conf_for_save.min()
+                conf_max = conf_for_save.max()
+                if conf_max > conf_min:
+                    conf_normalized = (conf_for_save - conf_min) / (conf_max - conf_min)
+                else:
+                    conf_normalized = np.zeros_like(conf_for_save)
+                conf_uint8 = (conf_normalized * 255).astype(np.uint8)
+                if not args.upsample_depth and resize_size is None:
+                    # Restore to original resolution
+                    conf_image = Image.fromarray(conf_uint8, mode="L")
+                    meta = preprocess_metas[idx]
+                    left = int(meta["total_pad_left"])
+                    top = int(meta["total_pad_top"])
+                    right = left + int(meta["effective_width"])
+                    bottom = top + int(meta["effective_height"])
+                    conf_image = conf_image.crop((left, top, right, bottom))
+                    conf_image = conf_image.resize(
+                        (int(meta["orig_width"]), int(meta["orig_height"])),
+                        Image.Resampling.BICUBIC,
+                    )
+                else:
+                    conf_image = Image.fromarray(conf_uint8, mode="L")
+                    if resize_size is not None:
+                        conf_image = conf_image.resize(resize_size, Image.Resampling.BICUBIC)
+                # Always save confidence as PNG for lossless grayscale
+                conf_path = scene_output_dir / f"{next_name}_confidence.png"
+                conf_image.save(conf_path)
             target_image = Image.open(image_paths[next_idx])
             reference_image = Image.open(image_paths[idx])
             try:
@@ -781,15 +1138,21 @@ def main() -> None:
                     reference_image = reference_image.resize(
                         resize_size, Image.Resampling.BICUBIC
                     )
-                target_image.save(target_path)
-                reference_image.save(reference_path)
+                target_image.save(target_path, **save_kwargs)
+                reference_image.save(reference_path, **save_kwargs)
             finally:
                 target_image.close()
                 reference_image.close()
 
+            # Save PLY file if requested
+            if args.save_ply:
+                ply_path = scene_output_dir / f"{next_name}_reference.ply"
+                write_ply(ply_path, points, colors, confidences if not args.no_confidence else None)
+            
+            ply_note = f" and {next_name}_reference.ply" if args.save_ply else ""
             print(
                 f"Wrote {scene_dir.name}/{splats_path.name}, {target_path.name}, "
-                f"and {reference_path.name}"
+                f"and {reference_path.name}{ply_note}"
             )
 
         del images
@@ -804,6 +1167,10 @@ def main() -> None:
         del preprocess_metas
         if device.type == "cuda":
             torch.cuda.empty_cache()
+        
+        # Clean up temporary rescaled images
+        if temp_resized_dir is not None and temp_resized_dir.exists():
+            shutil.rmtree(temp_resized_dir)
 
 
 if __name__ == "__main__":

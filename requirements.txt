@@ -1,0 +1,10 @@
+# VGGT core requirements
+-r vggt/requirements.txt
+
+# VGGT demo requirements
+-r vggt/requirements_demo.txt
+
+# Additional dependencies for dataset builder
+moderngl
+glcontext
+pillow-heif
