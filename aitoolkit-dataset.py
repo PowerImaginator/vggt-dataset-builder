@@ -45,27 +45,50 @@ def get_file_extension(pattern_path: Optional[Path]) -> str:
     return pattern_path.suffix.lower()
 
 
-def find_files_in_scene(scene_dir: Path) -> dict:
-    files = {
-        "splats": None,
-        "reference": None,
-        "target": None,
-    }
-
+def find_triplets_in_scene(scene_dir: Path) -> list[dict]:
+    """Find all triplets in a scene directory.
+    
+    Returns a list of dicts, each with keys:
+      - splats: Path to *_splats.<ext> file
+      - reference: Path to *_reference.<ext> file
+      - target: Path to *_target.<ext> file
+      - stem: Base name without suffix
+    """
+    triplets = {}
+    
     for file_path in scene_dir.iterdir():
         if not file_path.is_file():
             continue
-
+        
         name = file_path.name
-
+        
+        # Extract the stem (e.g., "image1" from "image1_splats.jpg")
         if "_splats" in name and file_path.suffix.lower() != ".ply":
-            files["splats"] = file_path
+            stem = name.split("_splats")[0]
+            if stem not in triplets:
+                triplets[stem] = {}
+            triplets[stem]["splats"] = file_path
+            triplets[stem]["stem"] = stem
         elif "_reference" in name and file_path.suffix.lower() != ".ply":
-            files["reference"] = file_path
+            stem = name.split("_reference")[0]
+            if stem not in triplets:
+                triplets[stem] = {}
+            triplets[stem]["reference"] = file_path
+            triplets[stem]["stem"] = stem
         elif "_target" in name and file_path.suffix.lower() != ".ply":
-            files["target"] = file_path
-
-    return files
+            stem = name.split("_target")[0]
+            if stem not in triplets:
+                triplets[stem] = {}
+            triplets[stem]["target"] = file_path
+            triplets[stem]["stem"] = stem
+    
+    # Filter to only complete triplets and return as list
+    complete_triplets = []
+    for stem, files in sorted(triplets.items()):
+        if "splats" in files and "reference" in files and "target" in files:
+            complete_triplets.append(files)
+    
+    return complete_triplets
 
 
 def extract_dataset(
@@ -98,38 +121,39 @@ def extract_dataset(
         if verbose:
             print(f"Processing {scene_name}...")
 
-        files = find_files_in_scene(scene_dir)
+        triplets = find_triplets_in_scene(scene_dir)
 
-        if files["splats"] is None or files["reference"] is None or files["target"] is None:
+        if not triplets:
             if verbose:
-                print(f"  Warning: Missing files in {scene_name}, skipping")
+                print(f"  Warning: No complete triplets found in {scene_name}, skipping")
             continue
 
-        ext = get_file_extension(files["splats"])
+        for files in triplets:
+            ext = get_file_extension(files["splats"])
 
-        control1_dest = control1_dir / f"{folder_counter}{ext}"
-        control2_dest = control2_dir / f"{folder_counter}{ext}"
-        target_dest = target_dir / f"{folder_counter}{ext}"
+            control1_dest = control1_dir / f"{folder_counter}{ext}"
+            control2_dest = control2_dir / f"{folder_counter}{ext}"
+            target_dest = target_dir / f"{folder_counter}{ext}"
 
-        shutil.copy2(files["splats"], control1_dest)
-        shutil.copy2(files["reference"], control2_dest)
-        shutil.copy2(files["target"], target_dest)
+            shutil.copy2(files["splats"], control1_dest)
+            shutil.copy2(files["reference"], control2_dest)
+            shutil.copy2(files["target"], target_dest)
 
-        if prompt is not None:
-            prompt_dest = target_dir / f"{folder_counter}.txt"
-            with open(prompt_dest, "w", encoding="utf-8") as f:
-                f.write(prompt)
-
-        if verbose:
-            print(f"  Created triplet {folder_counter}:")
-            print(f"    - control1/{control1_dest.name}")
-            print(f"    - control2/{control2_dest.name}")
-            print(f"    - target/{target_dest.name}")
             if prompt is not None:
-                print(f"    - target/{prompt_dest.name}")
+                prompt_dest = target_dir / f"{folder_counter}.txt"
+                with open(prompt_dest, "w", encoding="utf-8") as f:
+                    f.write(prompt)
 
-        folder_counter += 1
-        total_triplets += 1
+            if verbose:
+                print(f"  Created triplet {folder_counter} from {files['stem']}:")
+                print(f"    - control1/{control1_dest.name}")
+                print(f"    - control2/{control2_dest.name}")
+                print(f"    - target/{target_dest.name}")
+                if prompt is not None:
+                    print(f"    - target/{prompt_dest.name}")
+
+            folder_counter += 1
+            total_triplets += 1
 
     if verbose:
         print(f"\nExtraction complete!")

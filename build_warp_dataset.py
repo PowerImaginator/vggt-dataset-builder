@@ -128,9 +128,9 @@ def parse_args() -> argparse.Namespace:
         help=("Estimate s0 per frame from depth and intrinsics (default: off)."),
     )
     parser.add_argument(
-        "--no-confidence",
+        "--save-confidence",
         action="store_true",
-        help=("Do not save the depth confidence map (default: saves confidence)."),
+        help=("Save the depth confidence map (default: off)."),
     )
     parser.add_argument(
         "--limit",
@@ -173,6 +173,11 @@ def parse_args() -> argparse.Namespace:
         "--filter-white-bg",
         action="store_true",
         help="Filter white background points (RGB > 240, default: off).",
+    )
+    parser.add_argument(
+        "--bidirectional",
+        action="store_true",
+        help="Generate bidirectional pairs (A->B and B->A) for each consecutive frame pair (default: off).",
     )
     return parser.parse_args()
 
@@ -861,13 +866,6 @@ def main() -> None:
         scene_output_dir = output_dir / scene_dir.name
         scene_output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Skip if output folder already contains output files
-        output_ext = "jpg" if args.output_format in ["jpg", "jpeg"] else args.output_format
-        existing_outputs = list(scene_output_dir.glob(f"*_splats.{output_ext}"))
-        if existing_outputs:
-            print(f"Skipping {scene_dir.name}: output folder already contains {len(existing_outputs)} output file(s).")
-            continue
-
         if auto_skip_note is not None:
             print(
                 f"Auto skip for {scene_dir.name}: {auto_skip_note} "
@@ -1030,129 +1028,305 @@ def main() -> None:
         for idx in range(len(image_paths) - 1):
             next_idx = idx + 1
             next_name = image_paths[next_idx].stem
+            curr_name = image_paths[idx].stem
 
-            depth_frame = depth[idx]
-            conf_frame = depth_conf[idx]
-            if depth_frame.ndim == 3:
-                depth_frame = depth_frame.squeeze(-1)
-            if conf_frame.ndim == 3:
-                conf_frame = conf_frame.squeeze(-1)
+            output_ext = "jpg" if args.output_format in ["jpg", "jpeg"] else args.output_format
+            save_kwargs = {"quality": 95, "optimize": True} if output_ext == "jpg" else {}
+            
+            # Check which files are missing for forward direction
+            forward_splats_path = scene_output_dir / f"{next_name}_splats.{output_ext}"
+            forward_target_path = scene_output_dir / f"{next_name}_target.{output_ext}"
+            forward_reference_path = scene_output_dir / f"{next_name}_reference.{output_ext}"
+            forward_conf_path = scene_output_dir / f"{next_name}_confidence.png"
+            forward_ply_path = scene_output_dir / f"{next_name}_reference.ply"
+            
+            forward_missing = (
+                not forward_splats_path.exists() or 
+                not forward_target_path.exists() or 
+                not forward_reference_path.exists() or
+                (args.save_confidence and not forward_conf_path.exists()) or
+                (args.save_ply and not forward_ply_path.exists())
+            )
+
+            # ========== Forward direction: idx -> next_idx (A -> B) ==========
+            if forward_missing:
+                depth_frame = depth[idx]
+                conf_frame = depth_conf[idx]
+                if depth_frame.ndim == 3:
+                    depth_frame = depth_frame.squeeze(-1)
+                if conf_frame.ndim == 3:
+                    conf_frame = conf_frame.squeeze(-1)
+                
+                # Apply sky filtering if enabled
+                if args.filter_sky and skyseg_session is not None:
+                    sky_masks_dir = scene_output_dir / "sky_masks"
+                    conf_frame = apply_sky_filter(
+                        conf_frame, image_paths[idx], skyseg_session, sky_masks_dir
+                    )
+                
+                valid_mask = depth_frame > 1e-6
+
+                points = world_points[idx][valid_mask]
+                colors = images_np[idx][valid_mask]
+                confidences = conf_frame[valid_mask]
+                
+                # Apply background filtering if enabled
+                if args.filter_black_bg or args.filter_white_bg:
+                    bg_mask = apply_background_filters(
+                        colors, args.filter_black_bg, args.filter_white_bg
+                    )
+                    points = points[bg_mask]
+                    colors = colors[bg_mask]
+                    confidences = confidences[bg_mask]
+
+                if args.auto_s0:
+                    s0 = estimate_s0_from_depth(depth_frame, intrinsic[idx])
+                    if s0 > 0.0:
+                        renderer.s0 = s0
+
+                view_mat = build_view_matrix(extrinsic[next_idx])
+                if args.upsample_depth:
+                    target_intrinsic = intrinsic[next_idx]
+                else:
+                    target_intrinsic = intrinsic_for_output(
+                        intrinsic[next_idx], preprocess_metas[next_idx], resize_size
+                    )
+                proj_mat = build_projection_matrix(
+                    target_intrinsic, render_width, render_height
+                )
+                fov_y = 2.0 * np.arctan(0.5 * render_height / target_intrinsic[1, 1])
+
+                model_render = renderer.render(
+                    points, colors, confidences, view_mat, proj_mat, fov_y
+                )
+                if args.upsample_depth or resize_size is not None:
+                    splats_image = model_render
+                else:
+                    splats_image = restore_to_original_resolution(
+                        model_render, preprocess_metas[next_idx], args.preprocess_mode
+                    )
+
+                splats_path = forward_splats_path
+                target_path = forward_target_path
+                reference_path = forward_reference_path
+
+                if not splats_path.exists():
+                    Image.fromarray(splats_image).save(splats_path, **save_kwargs)
+
+                if args.save_confidence and not forward_conf_path.exists():
+                    # Save confidence map for the source frame (idx) as grayscale
+                    conf_for_save = conf_frame.copy()
+                    # Normalize to 0-255 range
+                    conf_min = conf_for_save.min()
+                    conf_max = conf_for_save.max()
+                    if conf_max > conf_min:
+                        conf_normalized = (conf_for_save - conf_min) / (conf_max - conf_min)
+                    else:
+                        conf_normalized = np.zeros_like(conf_for_save)
+                    conf_uint8 = (conf_normalized * 255).astype(np.uint8)
+                    if not args.upsample_depth and resize_size is None:
+                        # Restore to original resolution
+                        conf_image = Image.fromarray(conf_uint8, mode="L")
+                        meta = preprocess_metas[idx]
+                        left = int(meta["total_pad_left"])
+                        top = int(meta["total_pad_top"])
+                        right = left + int(meta["effective_width"])
+                        bottom = top + int(meta["effective_height"])
+                        conf_image = conf_image.crop((left, top, right, bottom))
+                        conf_image = conf_image.resize(
+                            (int(meta["orig_width"]), int(meta["orig_height"])),
+                            Image.Resampling.BICUBIC,
+                        )
+                    else:
+                        conf_image = Image.fromarray(conf_uint8, mode="L")
+                        if resize_size is not None:
+                            conf_image = conf_image.resize(resize_size, Image.Resampling.BICUBIC)
+                    # Always save confidence as PNG for lossless grayscale
+                    conf_image.save(forward_conf_path)
+                
+                if not target_path.exists() or not reference_path.exists():
+                    target_image = Image.open(image_paths[next_idx])
+                    reference_image = Image.open(image_paths[idx])
+                    try:
+                        target_image = target_image.convert("RGB")
+                        reference_image = reference_image.convert("RGB")
+                        if resize_size is not None:
+                            target_image = target_image.resize(
+                                resize_size, Image.Resampling.BICUBIC
+                            )
+                            reference_image = reference_image.resize(
+                                resize_size, Image.Resampling.BICUBIC
+                            )
+                        if not target_path.exists():
+                            target_image.save(target_path, **save_kwargs)
+                        if not reference_path.exists():
+                            reference_image.save(reference_path, **save_kwargs)
+                    finally:
+                        target_image.close()
+                        reference_image.close()
+
+                # Save PLY file if requested
+                if args.save_ply and not forward_ply_path.exists():
+                    write_ply(forward_ply_path, points, colors, confidences if args.save_confidence else None)
+                
+                ply_note = f" and {next_name}_reference.ply" if args.save_ply else ""
+                print(
+                    f"Wrote {scene_dir.name}/{splats_path.name}, {target_path.name}, "
+                    f"and {reference_path.name}{ply_note}"
+                )
+            else:
+                print(
+                    f"Skipped {scene_dir.name}/{next_name}_* (forward direction already complete)"
+                )
+
+            # ========== Reverse direction: next_idx -> idx (B -> A) ==========
+            if not args.bidirectional:
+                continue
+            
+            # Check which files are missing for reverse direction
+            reverse_splats_path = scene_output_dir / f"{curr_name}_splats.{output_ext}"
+            reverse_target_path = scene_output_dir / f"{curr_name}_target.{output_ext}"
+            reverse_reference_path = scene_output_dir / f"{curr_name}_reference.{output_ext}"
+            reverse_conf_path = scene_output_dir / f"{curr_name}_confidence.png"
+            reverse_ply_path = scene_output_dir / f"{curr_name}_reference.ply"
+            
+            reverse_missing = (
+                not reverse_splats_path.exists() or 
+                not reverse_target_path.exists() or 
+                not reverse_reference_path.exists() or
+                (args.save_confidence and not reverse_conf_path.exists()) or
+                (args.save_ply and not reverse_ply_path.exists())
+            )
+            
+            if not reverse_missing:
+                print(
+                    f"Skipped {scene_dir.name}/{curr_name}_* (reverse direction already complete)"
+                )
+                continue
+            
+            depth_frame_rev = depth[next_idx]
+            conf_frame_rev = depth_conf[next_idx]
+            if depth_frame_rev.ndim == 3:
+                depth_frame_rev = depth_frame_rev.squeeze(-1)
+            if conf_frame_rev.ndim == 3:
+                conf_frame_rev = conf_frame_rev.squeeze(-1)
             
             # Apply sky filtering if enabled
             if args.filter_sky and skyseg_session is not None:
                 sky_masks_dir = scene_output_dir / "sky_masks"
-                conf_frame = apply_sky_filter(
-                    conf_frame, image_paths[idx], skyseg_session, sky_masks_dir
+                conf_frame_rev = apply_sky_filter(
+                    conf_frame_rev, image_paths[next_idx], skyseg_session, sky_masks_dir
                 )
             
-            valid_mask = depth_frame > 1e-6
+            valid_mask_rev = depth_frame_rev > 1e-6
 
-            points = world_points[idx][valid_mask]
-            colors = images_np[idx][valid_mask]
-            confidences = conf_frame[valid_mask]
+            points_rev = world_points[next_idx][valid_mask_rev]
+            colors_rev = images_np[next_idx][valid_mask_rev]
+            confidences_rev = conf_frame_rev[valid_mask_rev]
             
             # Apply background filtering if enabled
             if args.filter_black_bg or args.filter_white_bg:
-                bg_mask = apply_background_filters(
-                    colors, args.filter_black_bg, args.filter_white_bg
+                bg_mask_rev = apply_background_filters(
+                    colors_rev, args.filter_black_bg, args.filter_white_bg
                 )
-                points = points[bg_mask]
-                colors = colors[bg_mask]
-                confidences = confidences[bg_mask]
+                points_rev = points_rev[bg_mask_rev]
+                colors_rev = colors_rev[bg_mask_rev]
+                confidences_rev = confidences_rev[bg_mask_rev]
 
             if args.auto_s0:
-                s0 = estimate_s0_from_depth(depth_frame, intrinsic[idx])
-                if s0 > 0.0:
-                    renderer.s0 = s0
+                s0_rev = estimate_s0_from_depth(depth_frame_rev, intrinsic[next_idx])
+                if s0_rev > 0.0:
+                    renderer.s0 = s0_rev
 
-            view_mat = build_view_matrix(extrinsic[next_idx])
+            view_mat_rev = build_view_matrix(extrinsic[idx])
             if args.upsample_depth:
-                target_intrinsic = intrinsic[next_idx]
+                target_intrinsic_rev = intrinsic[idx]
             else:
-                target_intrinsic = intrinsic_for_output(
-                    intrinsic[next_idx], preprocess_metas[next_idx], resize_size
+                target_intrinsic_rev = intrinsic_for_output(
+                    intrinsic[idx], preprocess_metas[idx], resize_size
                 )
-            proj_mat = build_projection_matrix(
-                target_intrinsic, render_width, render_height
+            proj_mat_rev = build_projection_matrix(
+                target_intrinsic_rev, render_width, render_height
             )
-            fov_y = 2.0 * np.arctan(0.5 * render_height / target_intrinsic[1, 1])
+            fov_y_rev = 2.0 * np.arctan(0.5 * render_height / target_intrinsic_rev[1, 1])
 
-            model_render = renderer.render(
-                points, colors, confidences, view_mat, proj_mat, fov_y
+            model_render_rev = renderer.render(
+                points_rev, colors_rev, confidences_rev, view_mat_rev, proj_mat_rev, fov_y_rev
             )
             if args.upsample_depth or resize_size is not None:
-                splats_image = model_render
+                splats_image_rev = model_render_rev
             else:
-                splats_image = restore_to_original_resolution(
-                    model_render, preprocess_metas[next_idx], args.preprocess_mode
+                splats_image_rev = restore_to_original_resolution(
+                    model_render_rev, preprocess_metas[idx], args.preprocess_mode
                 )
 
-            output_ext = "jpg" if args.output_format in ["jpg", "jpeg"] else args.output_format
-            splats_path = scene_output_dir / f"{next_name}_splats.{output_ext}"
-            target_path = scene_output_dir / f"{next_name}_target.{output_ext}"
-            reference_path = scene_output_dir / f"{next_name}_reference.{output_ext}"
+            splats_path_rev = reverse_splats_path
+            target_path_rev = reverse_target_path
+            reference_path_rev = reverse_reference_path
 
-            save_kwargs = {"quality": 95, "optimize": True} if output_ext == "jpg" else {}
-            Image.fromarray(splats_image).save(splats_path, **save_kwargs)
+            if not splats_path_rev.exists():
+                Image.fromarray(splats_image_rev).save(splats_path_rev, **save_kwargs)
 
-            if not args.no_confidence:
-                # Save confidence map for the source frame (idx) as grayscale
-                conf_for_save = conf_frame.copy()
+            if args.save_confidence and not reverse_conf_path.exists():
+                # Save confidence map for the source frame (next_idx) as grayscale
+                conf_for_save_rev = conf_frame_rev.copy()
                 # Normalize to 0-255 range
-                conf_min = conf_for_save.min()
-                conf_max = conf_for_save.max()
-                if conf_max > conf_min:
-                    conf_normalized = (conf_for_save - conf_min) / (conf_max - conf_min)
+                conf_min_rev = conf_for_save_rev.min()
+                conf_max_rev = conf_for_save_rev.max()
+                if conf_max_rev > conf_min_rev:
+                    conf_normalized_rev = (conf_for_save_rev - conf_min_rev) / (conf_max_rev - conf_min_rev)
                 else:
-                    conf_normalized = np.zeros_like(conf_for_save)
-                conf_uint8 = (conf_normalized * 255).astype(np.uint8)
+                    conf_normalized_rev = np.zeros_like(conf_for_save_rev)
+                conf_uint8_rev = (conf_normalized_rev * 255).astype(np.uint8)
                 if not args.upsample_depth and resize_size is None:
                     # Restore to original resolution
-                    conf_image = Image.fromarray(conf_uint8, mode="L")
-                    meta = preprocess_metas[idx]
-                    left = int(meta["total_pad_left"])
-                    top = int(meta["total_pad_top"])
-                    right = left + int(meta["effective_width"])
-                    bottom = top + int(meta["effective_height"])
-                    conf_image = conf_image.crop((left, top, right, bottom))
-                    conf_image = conf_image.resize(
-                        (int(meta["orig_width"]), int(meta["orig_height"])),
+                    conf_image_rev = Image.fromarray(conf_uint8_rev, mode="L")
+                    meta_rev = preprocess_metas[next_idx]
+                    left_rev = int(meta_rev["total_pad_left"])
+                    top_rev = int(meta_rev["total_pad_top"])
+                    right_rev = left_rev + int(meta_rev["effective_width"])
+                    bottom_rev = top_rev + int(meta_rev["effective_height"])
+                    conf_image_rev = conf_image_rev.crop((left_rev, top_rev, right_rev, bottom_rev))
+                    conf_image_rev = conf_image_rev.resize(
+                        (int(meta_rev["orig_width"]), int(meta_rev["orig_height"])),
                         Image.Resampling.BICUBIC,
                     )
                 else:
-                    conf_image = Image.fromarray(conf_uint8, mode="L")
+                    conf_image_rev = Image.fromarray(conf_uint8_rev, mode="L")
                     if resize_size is not None:
-                        conf_image = conf_image.resize(resize_size, Image.Resampling.BICUBIC)
+                        conf_image_rev = conf_image_rev.resize(resize_size, Image.Resampling.BICUBIC)
                 # Always save confidence as PNG for lossless grayscale
-                conf_path = scene_output_dir / f"{next_name}_confidence.png"
-                conf_image.save(conf_path)
-            target_image = Image.open(image_paths[next_idx])
-            reference_image = Image.open(image_paths[idx])
-            try:
-                target_image = target_image.convert("RGB")
-                reference_image = reference_image.convert("RGB")
-                if resize_size is not None:
-                    target_image = target_image.resize(
-                        resize_size, Image.Resampling.BICUBIC
-                    )
-                    reference_image = reference_image.resize(
-                        resize_size, Image.Resampling.BICUBIC
-                    )
-                target_image.save(target_path, **save_kwargs)
-                reference_image.save(reference_path, **save_kwargs)
-            finally:
-                target_image.close()
-                reference_image.close()
+                conf_image_rev.save(reverse_conf_path)
+
+            if not target_path_rev.exists() or not reference_path_rev.exists():
+                target_image_rev = Image.open(image_paths[idx])
+                reference_image_rev = Image.open(image_paths[next_idx])
+                try:
+                    target_image_rev = target_image_rev.convert("RGB")
+                    reference_image_rev = reference_image_rev.convert("RGB")
+                    if resize_size is not None:
+                        target_image_rev = target_image_rev.resize(
+                            resize_size, Image.Resampling.BICUBIC
+                        )
+                        reference_image_rev = reference_image_rev.resize(
+                            resize_size, Image.Resampling.BICUBIC
+                        )
+                    if not target_path_rev.exists():
+                        target_image_rev.save(target_path_rev, **save_kwargs)
+                    if not reference_path_rev.exists():
+                        reference_image_rev.save(reference_path_rev, **save_kwargs)
+                finally:
+                    target_image_rev.close()
+                    reference_image_rev.close()
 
             # Save PLY file if requested
-            if args.save_ply:
-                ply_path = scene_output_dir / f"{next_name}_reference.ply"
-                write_ply(ply_path, points, colors, confidences if not args.no_confidence else None)
+            if args.save_ply and not reverse_ply_path.exists():
+                write_ply(reverse_ply_path, points_rev, colors_rev, confidences_rev if args.save_confidence else None)
             
-            ply_note = f" and {next_name}_reference.ply" if args.save_ply else ""
+            ply_note_rev = f" and {curr_name}_reference.ply" if args.save_ply else ""
             print(
-                f"Wrote {scene_dir.name}/{splats_path.name}, {target_path.name}, "
-                f"and {reference_path.name}{ply_note}"
+                f"Wrote {scene_dir.name}/{splats_path_rev.name}, {target_path_rev.name}, "
+                f"and {reference_path_rev.name}{ply_note_rev}"
             )
 
         del images

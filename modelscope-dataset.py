@@ -39,19 +39,16 @@ def get_file_extension(pattern_path: Optional[Path]) -> str:
     return pattern_path.suffix.lower()
 
 
-def find_files_in_scene(scene_dir: Path) -> dict:
-    """Find splats, reference, and target files in a scene directory.
+def find_triplets_in_scene(scene_dir: Path) -> list[dict]:
+    """Find all triplets in a scene directory.
     
-    Returns a dict with keys:
+    Returns a list of dicts, each with keys:
       - splats: Path to *_splats.<ext> file
       - reference: Path to *_reference.<ext> file (excluding .ply)
       - target: Path to *_target.<ext> file
+      - stem: Base name without suffix
     """
-    files = {
-        "splats": None,
-        "reference": None,
-        "target": None,
-    }
+    triplets = {}
     
     for file_path in scene_dir.iterdir():
         if not file_path.is_file():
@@ -59,17 +56,34 @@ def find_files_in_scene(scene_dir: Path) -> dict:
         
         name = file_path.name
         
+        # Extract the stem (e.g., "image1" from "image1_splats.jpg")
         if "_splats" in name and file_path.suffix.lower() != ".ply":
-            files["splats"] = file_path
-        
+            stem = name.split("_splats")[0]
+            if stem not in triplets:
+                triplets[stem] = {}
+            triplets[stem]["splats"] = file_path
+            triplets[stem]["stem"] = stem
         elif "_reference" in name and file_path.suffix.lower() != ".ply":
             # Skip PLY files for reference
-            files["reference"] = file_path
-        
+            stem = name.split("_reference")[0]
+            if stem not in triplets:
+                triplets[stem] = {}
+            triplets[stem]["reference"] = file_path
+            triplets[stem]["stem"] = stem
         elif "_target" in name and file_path.suffix.lower() != ".ply":
-            files["target"] = file_path
+            stem = name.split("_target")[0]
+            if stem not in triplets:
+                triplets[stem] = {}
+            triplets[stem]["target"] = file_path
+            triplets[stem]["stem"] = stem
     
-    return files
+    # Filter to only complete triplets and return as list
+    complete_triplets = []
+    for stem, files in sorted(triplets.items()):
+        if "splats" in files and "reference" in files and "target" in files:
+            complete_triplets.append(files)
+    
+    return complete_triplets
 
 
 def extract_dataset(
@@ -108,42 +122,44 @@ def extract_dataset(
         if verbose:
             print(f"Processing {scene_name}...")
         
-        files = find_files_in_scene(scene_dir)
+        triplets = find_triplets_in_scene(scene_dir)
         
-        # Skip if any required file is missing
-        if files["splats"] is None or files["reference"] is None or files["target"] is None:
+        # Skip if no complete triplets found
+        if not triplets:
             if verbose:
-                print(f"  Warning: Missing files in {scene_name}, skipping")
+                print(f"  Warning: No complete triplets found in {scene_name}, skipping")
             continue
         
-        # Get file extension (use the first available file's extension)
-        ext = get_file_extension(files["splats"])
-        
-        # Copy files with new names
-        splats_dest = modelscope_dir / f"{folder_counter}_start_1{ext}"
-        reference_dest = modelscope_dir / f"{folder_counter}_start_2{ext}"
-        target_dest = modelscope_dir / f"{folder_counter}_end{ext}"
-        
-        shutil.copy2(files["splats"], splats_dest)
-        shutil.copy2(files["reference"], reference_dest)
-        shutil.copy2(files["target"], target_dest)
-        
-        # Write prompt file if provided
-        if prompt is not None:
-            prompt_dest = modelscope_dir / f"{folder_counter}.txt"
-            with open(prompt_dest, "w", encoding="utf-8") as f:
-                f.write(prompt)
-        
-        if verbose:
-            print(f"  Created triplet {folder_counter}:")
-            print(f"    - {splats_dest.name}")
-            print(f"    - {reference_dest.name}")
-            print(f"    - {target_dest.name}")
+        # Process each triplet
+        for files in triplets:
+            # Get file extension (use the first available file's extension)
+            ext = get_file_extension(files["splats"])
+            
+            # Copy files with new names
+            splats_dest = modelscope_dir / f"{folder_counter}_start_1{ext}"
+            reference_dest = modelscope_dir / f"{folder_counter}_start_2{ext}"
+            target_dest = modelscope_dir / f"{folder_counter}_end{ext}"
+            
+            shutil.copy2(files["splats"], splats_dest)
+            shutil.copy2(files["reference"], reference_dest)
+            shutil.copy2(files["target"], target_dest)
+            
+            # Write prompt file if provided
             if prompt is not None:
-                print(f"    - {prompt_dest.name}")
-        
-        folder_counter += 1
-        total_triplets += 1
+                prompt_dest = modelscope_dir / f"{folder_counter}.txt"
+                with open(prompt_dest, "w", encoding="utf-8") as f:
+                    f.write(prompt)
+            
+            if verbose:
+                print(f"  Created triplet {folder_counter} from {files['stem']}:")
+                print(f"    - {splats_dest.name}")
+                print(f"    - {reference_dest.name}")
+                print(f"    - {target_dest.name}")
+                if prompt is not None:
+                    print(f"    - {prompt_dest.name}")
+            
+            folder_counter += 1
+            total_triplets += 1
     
     if verbose:
         print(f"\nExtraction complete!")

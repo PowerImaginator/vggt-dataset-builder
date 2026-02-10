@@ -68,6 +68,17 @@ Filter sky and background for cleaner point clouds:
 uv run python build_warp_dataset.py --upsample-depth --auto-s0 --filter-sky --filter-black-bg
 ```
 
+Generate bidirectional pairs for enhanced training:
+```bash
+uv run python build_warp_dataset.py --upsample-depth --auto-s0 --bidirectional
+```
+
+Resume interrupted runs or add bidirectional pairs to existing datasets:
+```bash
+# Run again with --bidirectional - only missing files will be generated
+uv run python build_warp_dataset.py --upsample-depth --auto-s0 --bidirectional
+```
+
 **Note**: `--filter-sky` requires additional dependencies:
 ```bash
 uv pip install opencv-python onnxruntime
@@ -132,7 +143,7 @@ uv run python aitoolkit.py --prompt "refer to image 2, fix the distortion and bl
 ### Input/Output
 - `--input-dir <path>`: Directory with input images organized in subdirectories (default: `input`)
 - `--output-dir <path>`: Directory for output image pairs (default: `output`)
-- `--output-format <format>`: Output format - `jpg` (default), `jpeg`, or `png`. JPG saves with quality=95 and optimization enabled. Confidence maps are always saved as PNG.
+- `--output-format <format>`: Output format - `jpg` (default), `jpeg`, or `png`. JPG saves with quality=95 and optimization enabled. Confidence maps (when enabled) are always saved as PNG.
 
 ### Resolution Control
 - `--max-megapixels <float>`: Maximum resolution in megapixels (default: 1.0). **Input images are automatically rescaled in-memory** to this limit before processing, constraining memory usage throughout the entire pipeline. Temporary rescaled images are cleaned up after each scene.
@@ -149,7 +160,7 @@ uv run python aitoolkit.py --prompt "refer to image 2, fix the distortion and bl
 - `--depth-conf-threshold <float>`: Filter depth points with confidence below this value (default: 1.01, keeps all points). Lower values filter more aggressively.
 - `--sigma <float>`: Gaussian splatting sigma parameter controlling splat size (default: 20.0)
 - `--auto-s0`: Automatically estimate per-frame Gaussian splat size (s0) from depth and intrinsics (disabled by default)
-- `--no-confidence`: Skip saving depth confidence maps (saves confidence by default)
+- `--save-confidence`: Save depth confidence maps as PNG files (disabled by default)
 - `--save-ply`: Save point clouds as PLY files for reference frames (disabled by default). Creates viewable 3D point clouds with RGB colors and optional confidence values.
 
 ### Point Cloud Filtering
@@ -162,6 +173,7 @@ uv run python aitoolkit.py --prompt "refer to image 2, fix the distortion and bl
 - `--auto-skip`: Automatically select frames based on `transforms.json` view overlap (disabled by default)
 - `--target-overlap <float>`: Target view overlap (0-1) for auto-skip (default: 0.5)
 - `--limit <int>`: Process only first N images per scene after filtering (default: 0, no limit)
+- `--bidirectional`: Generate bidirectional pairs (A→B and B→A) for each consecutive frame pair (disabled by default). This doubles the dataset by creating warping pairs in both directions between consecutive frames. **Smart file detection**: Automatically detects existing triplet files and only creates missing ones, allowing you to resume interrupted runs or add bidirectional pairs to existing datasets without re-processing.
 
 ### System
 - `--device <device>`: Force device selection - `cuda` or `cpu` (default: auto-detects CUDA availability)
@@ -190,18 +202,29 @@ For each scene, generates triplets (or quadruplets with `--save-ply`) of images 
 ```
 output/
   scene1/
-    image2_splats.jpg      # Rendered from previous view
+    image2_splats.jpg      # Rendered from previous view (image1→image2)
     image2_target.jpg      # Ground truth current view
     image2_reference.jpg   # Previous view (reference)
-    image2_confidence.png  # Depth confidence map (if not --no-confidence)
+    image2_confidence.png  # Depth confidence map (if --save-confidence)
     image2_reference.ply   # Point cloud (if --save-ply)
+```
+
+With `--bidirectional`, also generates reverse pairs:
+```
+output/
+  scene1/
+    image1_splats.jpg      # Rendered from next view (image2→image1)
+    image1_target.jpg      # Ground truth previous view
+    image1_reference.jpg   # Next view (reference)
+    image1_confidence.png  # Depth confidence map (if --save-confidence)
+    image1_reference.ply   # Point cloud (if --save-ply)
 ```
 
 ### PLY Files
 When `--save-ply` is enabled, point cloud files are saved in binary PLY format containing:
 - **Vertices**: 3D world coordinates (X, Y, Z) for each valid depth point
 - **Colors**: RGB values (0-255) from the reference image
-- **Confidence**: Depth confidence values (if not `--no-confidence`)
+- **Confidence**: Depth confidence values (if `--save-confidence` is also enabled)
 
 Binary format provides ~80% smaller file sizes compared to ASCII. PLY files can be viewed in tools like MeshLab, CloudCompare, or Blender.
 
