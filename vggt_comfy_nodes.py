@@ -119,17 +119,18 @@ def write_ply_basic(path, points, colors, confs, scale_multiplier=0.5):
     print(f"[PLY Writer] Opacity logits range: [{opacity_logits.min():.3f}, {opacity_logits.max():.3f}]")
 
 class VGGT_Model_Inference:
+    def __init__(self):
+        pass
+    
     @classmethod
     def INPUT_TYPES(cls):
-        return {
+        """Generate input types with only first image required."""
+        inputs = {
             "required": {
                 "image_1": ("IMAGE",),
                 "device": (["cuda", "cpu"], {"default": "cuda"}),
             },
             "optional": {
-                "image_2": ("IMAGE", {"tooltip": "Optional second image for multi-frame inference"}),
-                "image_3": ("IMAGE", {"tooltip": "Optional third image for multi-frame inference"}),
-                "image_4": ("IMAGE", {"tooltip": "Optional fourth image for multi-frame inference"}),
                 "depth_conf_threshold": ("FLOAT", {
                     "default": 50.0,
                     "min": 0.0,
@@ -156,6 +157,10 @@ class VGGT_Model_Inference:
                     "default": False,
                     "tooltip": "Filter out white background pixels (useful for images with white backgrounds)"
                 }),
+                "mask_sky": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Filter out sky pixels using semantic segmentation. Requires opencv-python and onnxruntime."
+                }),
                 "boundary_threshold": ("INT", {
                     "default": 0,
                     "min": 0,
@@ -171,21 +176,40 @@ class VGGT_Model_Inference:
                 }),
             }
         }
+        
+        return inputs
+    
+    @staticmethod
+    def IS_CHANGED(image_1, **kwargs):
+        """This helps ComfyUI understand when the node has actually changed"""
+        return float("nan")
+    
+    def get_title(self):
+        """Dynamic title that shows how many images are connected"""
+        return "VGGT Model Inference"
+    
+    @classmethod
+    def VALIDATE_INPUTS(cls, **kwargs):
+        """Validate inputs and log which images are connected"""
+        return True
 
     RETURN_TYPES = ("STRING", "EXTRINSICS", "INTRINSICS")
     RETURN_NAMES = ("ply_path", "extrinsics", "intrinsics")
     FUNCTION = "infer"
     CATEGORY = "VGGT"
 
-    def infer(self, image_1, device, image_2=None, image_3=None, image_4=None, depth_conf_threshold=50.0, gaussian_scale_multiplier=0.1, preprocess_mode="pad_white", mask_black_bg=False, mask_white_bg=False, boundary_threshold=0, max_depth=-1.0):
+    def infer(self, image_1, device, depth_conf_threshold=50.0, gaussian_scale_multiplier=0.1, preprocess_mode="pad_white", mask_black_bg=False, mask_white_bg=False, mask_sky=False, boundary_threshold=0, max_depth=-1.0, **kwargs):
         # Combine multiple images into a sequence
+        # Dynamically collect all connected image inputs from image_2 onwards
         images_list = [image_1]
-        if image_2 is not None:
-            images_list.append(image_2)
-        if image_3 is not None:
-            images_list.append(image_3)
-        if image_4 is not None:
-            images_list.append(image_4)
+        
+        # Extract connected images from kwargs (image_2, image_3, etc.)
+        for i in range(2, 21):
+            image_key = f"image_{i}"
+            if image_key in kwargs and kwargs[image_key] is not None:
+                images_list.append(kwargs[image_key])
+        
+        print(f"[VGGT] Detected {len(images_list)} connected image input(s)")
         
         # ===== KEY FIX: Preprocess each image individually with consistent output dimensions =====
         # When images have different aspect ratios, we preprocess each one separately
@@ -389,6 +413,89 @@ class VGGT_Model_Inference:
             white_mask = ~((colors_all_frames[:, 0] > 240/255.0) & (colors_all_frames[:, 1] > 240/255.0) & (colors_all_frames[:, 2] > 240/255.0))
             valid_mask_all = valid_mask_all & white_mask
             print(f"[VGGT] Applied mask_white_bg filter")
+        
+        # Apply sky filtering if enabled
+        if mask_sky:
+            try:
+                import cv2
+                import onnxruntime as ort
+                from pathlib import Path
+                
+                # Initialize sky segmentation session (lazy loading)
+                skyseg_model_path = Path(__file__).parent / "skyseg.onnx"
+                if not skyseg_model_path.exists():
+                    print(f"[VGGT] Downloading sky segmentation model to {skyseg_model_path}...")
+                    import urllib.request
+                    model_url = "https://huggingface.co/JianyuanWang/skyseg/resolve/main/skyseg.onnx"
+                    urllib.request.urlretrieve(model_url, skyseg_model_path)
+                    print(f"[VGGT] Downloaded sky segmentation model")
+                
+                skyseg_session = ort.InferenceSession(str(skyseg_model_path), providers=['CPUExecutionProvider'])
+                
+                # Apply sky filtering per frame
+                sky_mask_all = np.ones(S * H * W, dtype=bool)
+                total_sky_points = 0
+                
+                for s in range(S):
+                    # Get the original image for this frame (from model_input_np)
+                    # Convert RGB to BGR for OpenCV
+                    frame_img = (model_input_np[s] * 255).astype(np.uint8)
+                    frame_img_bgr = cv2.cvtColor(frame_img, cv2.COLOR_RGB2BGR)
+                    
+                    # Resize to 320x320 for sky segmentation model
+                    img_resized = cv2.resize(frame_img_bgr, (320, 320))
+                    
+                    # Convert back to RGB and normalize with PyTorch stats
+                    img_rgb = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
+                    img_input = img_rgb.astype(np.float32)
+                    mean = np.array([0.485, 0.456, 0.406])
+                    std = np.array([0.229, 0.224, 0.225])
+                    img_input = (img_input / 255.0 - mean) / std
+                    
+                    # Transpose to CHW and add batch dimension
+                    img_input = np.transpose(img_input, (2, 0, 1))
+                    img_input = np.expand_dims(img_input, axis=0).astype(np.float32)
+                    
+                    # Run segmentation
+                    input_name = skyseg_session.get_inputs()[0].name
+                    output_name = skyseg_session.get_outputs()[0].name
+                    outputs = skyseg_session.run([output_name], {input_name: img_input})
+                    sky_pred = np.array(outputs).squeeze()
+                    
+                    # Post-process: normalize to 0-255
+                    min_val = np.min(sky_pred)
+                    max_val = np.max(sky_pred)
+                    sky_pred = (sky_pred - min_val) / (max_val - min_val) * 255
+                    sky_pred = sky_pred.astype(np.uint8)
+                    
+                    # Resize back to original resolution
+                    sky_mask_resized = cv2.resize(sky_pred, (W, H))
+                    
+                    # Debug: check mask values
+                    print(f"[VGGT] Frame {s} sky mask - min: {sky_mask_resized.min()}, max: {sky_mask_resized.max()}, mean: {sky_mask_resized.mean():.2f}")
+                    
+                    # Threshold: Based on segment_sky reference implementation
+                    # The model outputs LOW values for NON-SKY (ground, objects) and HIGH values for SKY
+                    # So we KEEP where values < 32 (non-sky) and REMOVE where values >= 32 (sky)
+                    frame_keep_mask = sky_mask_resized < 32  # True where we want to KEEP points (non-sky)
+                    keep_points = np.sum(frame_keep_mask)
+                    sky_points = np.sum(~frame_keep_mask)
+                    total_sky_points += sky_points
+                    print(f"[VGGT] Frame {s} - keeping {keep_points} non-sky points, filtering {sky_points} sky points")
+                    
+                    # Apply to the corresponding portion of the full mask
+                    frame_offset = s * H * W
+                    sky_mask_all[frame_offset:frame_offset + H * W] = frame_keep_mask.flatten()
+                
+                valid_mask_all = valid_mask_all & sky_mask_all
+                print(f"[VGGT] Applied mask_sky filter (filtered {total_sky_points} sky points across all frames)")
+                
+            except ImportError as e:
+                print(f"[VGGT] Warning: Sky filtering requires opencv-python and onnxruntime. Skipping. Error: {e}")
+            except Exception as e:
+                print(f"[VGGT] Warning: Sky filtering failed: {e}")
+                import traceback
+                traceback.print_exc()
         
         points = points_all_frames[valid_mask_all]
         colors = colors_all_frames[valid_mask_all]
