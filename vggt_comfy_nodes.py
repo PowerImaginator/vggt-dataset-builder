@@ -119,17 +119,19 @@ def write_ply_basic(path, points, colors, confs, scale_multiplier=0.5):
     print(f"[PLY Writer] Opacity logits range: [{opacity_logits.min():.3f}, {opacity_logits.max():.3f}]")
 
 class VGGT_Model_Inference:
+    def __init__(self):
+        # Track how many image slots are currently enabled
+        self._max_image_slot = 1
+    
     @classmethod
     def INPUT_TYPES(cls):
-        return {
+        """Generate input types dynamically with many optional image slots."""
+        inputs = {
             "required": {
                 "image_1": ("IMAGE",),
                 "device": (["cuda", "cpu"], {"default": "cuda"}),
             },
             "optional": {
-                "image_2": ("IMAGE", {"tooltip": "Optional second image for multi-frame inference"}),
-                "image_3": ("IMAGE", {"tooltip": "Optional third image for multi-frame inference"}),
-                "image_4": ("IMAGE", {"tooltip": "Optional fourth image for multi-frame inference"}),
                 "depth_conf_threshold": ("FLOAT", {
                     "default": 50.0,
                     "min": 0.0,
@@ -171,21 +173,33 @@ class VGGT_Model_Inference:
                 }),
             }
         }
+        
+        # Add up to 20 optional image inputs to support multi-frame sequences
+        # ComfyUI will dynamically show these as they're connected
+        for i in range(2, 21):
+            inputs["optional"][f"image_{i}"] = ("IMAGE", {
+                "tooltip": f"Optional image {i} for multi-frame inference"
+            })
+        
+        return inputs
 
     RETURN_TYPES = ("STRING", "EXTRINSICS", "INTRINSICS")
     RETURN_NAMES = ("ply_path", "extrinsics", "intrinsics")
     FUNCTION = "infer"
     CATEGORY = "VGGT"
 
-    def infer(self, image_1, device, image_2=None, image_3=None, image_4=None, depth_conf_threshold=50.0, gaussian_scale_multiplier=0.1, preprocess_mode="pad_white", mask_black_bg=False, mask_white_bg=False, boundary_threshold=0, max_depth=-1.0):
+    def infer(self, image_1, device, depth_conf_threshold=50.0, gaussian_scale_multiplier=0.1, preprocess_mode="pad_white", mask_black_bg=False, mask_white_bg=False, boundary_threshold=0, max_depth=-1.0, **kwargs):
         # Combine multiple images into a sequence
+        # Dynamically collect all connected image inputs from image_2 onwards
         images_list = [image_1]
-        if image_2 is not None:
-            images_list.append(image_2)
-        if image_3 is not None:
-            images_list.append(image_3)
-        if image_4 is not None:
-            images_list.append(image_4)
+        
+        # Extract connected images from kwargs (image_2, image_3, etc.)
+        for i in range(2, 21):
+            image_key = f"image_{i}"
+            if image_key in kwargs and kwargs[image_key] is not None:
+                images_list.append(kwargs[image_key])
+        
+        print(f"[VGGT] Detected {len(images_list)} connected image input(s)")
         
         # ===== KEY FIX: Preprocess each image individually with consistent output dimensions =====
         # When images have different aspect ratios, we preprocess each one separately
