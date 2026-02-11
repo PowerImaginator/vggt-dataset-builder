@@ -763,6 +763,78 @@ def build_projection_matrix(
     return proj
 
 
+def check_scene_needs_processing(
+    scene_dir: Path,
+    output_dir: Path,
+    output_ext: str,
+    bidirectional: bool,
+    save_confidence: bool,
+    save_ply: bool,
+    image_paths: list[Path],
+) -> bool:
+    """Check if this scene needs any processing.
+    
+    Returns True if any pair is missing files, False if all pairs complete.
+    """
+    if len(image_paths) < 2:
+        return False
+    
+    scene_output_dir = output_dir / scene_dir.name
+    scene_output_dir.mkdir(parents=True, exist_ok=True)
+    
+    for idx in range(len(image_paths) - 1):
+        next_idx = idx + 1
+        next_name = image_paths[next_idx].stem
+        curr_name = image_paths[idx].stem
+        
+        # Check both original and rescaled versions of the filename
+        def files_exist_for_name(name: str, direction: str) -> bool:
+            # Check with original name
+            splats = scene_output_dir / f"{name}_splats.{output_ext}"
+            target = scene_output_dir / f"{name}_target.{output_ext}"
+            reference = scene_output_dir / f"{name}_reference.{output_ext}"
+            conf = scene_output_dir / f"{name}_confidence.png"
+            ply = scene_output_dir / f"{name}_reference.ply"
+            
+            files_ok = (
+                splats.exists() and 
+                target.exists() and 
+                reference.exists() and
+                (not save_confidence or conf.exists()) and
+                (not save_ply or ply.exists())
+            )
+            
+            if files_ok:
+                return True
+            
+            # Check with _rescaled variant
+            rescaled_name = f"{name}_rescaled"
+            splats = scene_output_dir / f"{rescaled_name}_splats.{output_ext}"
+            target = scene_output_dir / f"{rescaled_name}_target.{output_ext}"
+            reference = scene_output_dir / f"{rescaled_name}_reference.{output_ext}"
+            conf = scene_output_dir / f"{rescaled_name}_confidence.png"
+            ply = scene_output_dir / f"{rescaled_name}_reference.ply"
+            
+            return (
+                splats.exists() and 
+                target.exists() and 
+                reference.exists() and
+                (not save_confidence or conf.exists()) and
+                (not save_ply or ply.exists())
+            )
+        
+        # Check forward direction files
+        if not files_exist_for_name(next_name, "forward"):
+            return True  # Forward direction needs work
+        
+        # Check reverse direction if bidirectional
+        if bidirectional:
+            if not files_exist_for_name(curr_name, "reverse"):
+                return True  # Reverse direction needs work
+    
+    return False  # All pairs complete
+
+
 def intrinsic_for_output(
     model_intrinsic: np.ndarray,
     meta: dict[str, float],
@@ -863,8 +935,27 @@ def main() -> None:
             print(f"Skipping {scene_dir}: {exc}")
             continue
 
+        output_ext = "jpg" if args.output_format in ["jpg", "jpeg"] else args.output_format
+        
         scene_output_dir = output_dir / scene_dir.name
         scene_output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Check upfront if this scene needs any processing (before rescaling to save time)
+        scene_needs_work = check_scene_needs_processing(
+            scene_dir,
+            output_dir,
+            output_ext,
+            args.bidirectional,
+            args.save_confidence,
+            args.save_ply,
+            image_paths,
+        )
+        
+        if not scene_needs_work:
+            print(f"Skipping {scene_dir.name}: all triplets already complete")
+            continue
+        
+        print(f"Processing {scene_dir.name}...")
 
         if auto_skip_note is not None:
             print(
@@ -1033,7 +1124,7 @@ def main() -> None:
             output_ext = "jpg" if args.output_format in ["jpg", "jpeg"] else args.output_format
             save_kwargs = {"quality": 95, "optimize": True} if output_ext == "jpg" else {}
             
-            # Check which files are missing for forward direction
+            # Setup paths for this pair
             forward_splats_path = scene_output_dir / f"{next_name}_splats.{output_ext}"
             forward_target_path = scene_output_dir / f"{next_name}_target.{output_ext}"
             forward_reference_path = scene_output_dir / f"{next_name}_reference.{output_ext}"
