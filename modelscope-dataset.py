@@ -31,6 +31,12 @@ import shutil
 from pathlib import Path
 from typing import Optional
 
+try:
+    from PIL import Image
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
+
 
 def get_file_extension(pattern_path: Optional[Path]) -> str:
     """Get file extension from a path, or return empty string if None."""
@@ -57,21 +63,22 @@ def find_triplets_in_scene(scene_dir: Path) -> list[dict]:
         name = file_path.name
         
         # Extract the stem (e.g., "image1" from "image1_splats.jpg")
-        if "_splats" in name and file_path.suffix.lower() != ".ply":
-            stem = name.split("_splats")[0]
+        # Only match specific suffixes to avoid metadata files like _reference_intrinsics.txt
+        if name.endswith("_splats.jpg") or name.endswith("_splats.png"):
+            stem = name.replace("_splats.jpg", "").replace("_splats.png", "")
             if stem not in triplets:
                 triplets[stem] = {}
             triplets[stem]["splats"] = file_path
             triplets[stem]["stem"] = stem
-        elif "_reference" in name and file_path.suffix.lower() != ".ply":
-            # Skip PLY files for reference
-            stem = name.split("_reference")[0]
+        elif (name.endswith("_reference.jpg") or name.endswith("_reference.png")):
+            # Only match JPG and PNG, NOT PLY or TXT files
+            stem = name.replace("_reference.jpg", "").replace("_reference.png", "")
             if stem not in triplets:
                 triplets[stem] = {}
             triplets[stem]["reference"] = file_path
             triplets[stem]["stem"] = stem
-        elif "_target" in name and file_path.suffix.lower() != ".ply":
-            stem = name.split("_target")[0]
+        elif name.endswith("_target.jpg") or name.endswith("_target.png"):
+            stem = name.replace("_target.jpg", "").replace("_target.png", "")
             if stem not in triplets:
                 triplets[stem] = {}
             triplets[stem]["target"] = file_path
@@ -139,6 +146,21 @@ def extract_dataset(
             splats_dest = modelscope_dir / f"{folder_counter}_start_1{ext}"
             reference_dest = modelscope_dir / f"{folder_counter}_start_2{ext}"
             target_dest = modelscope_dir / f"{folder_counter}_end{ext}"
+            
+            # Validate image files are readable before copying
+            if HAS_PIL:
+                for src_file, dest_name in [
+                    (files["splats"], "splats"),
+                    (files["reference"], "reference"),
+                    (files["target"], "target"),
+                ]:
+                    try:
+                        img = Image.open(src_file)
+                        # Force load to verify the file is valid
+                        img.load()
+                    except Exception as e:
+                        print(f"  ERROR: Invalid image file {src_file.name}: {e}")
+                        raise ValueError(f"Cannot read {dest_name} image: {src_file}")
             
             shutil.copy2(files["splats"], splats_dest)
             shutil.copy2(files["reference"], reference_dest)
