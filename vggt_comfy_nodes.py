@@ -497,9 +497,6 @@ class VGGT_Model_Inference:
         # Keep in [0, 1] range - write_ply_basic handles conversion to SH coefficients
         colors_all_frames = model_input_np.reshape(-1, 3).astype(np.float32)  # (S*H*W, 3) in [0, 1]
         
-        # Clean up model_input_np after extracting colors
-        del model_input_np
-        
         # Flatten confidence scores
         if depth_conf.ndim == 4:
             conf_all_frames = depth_conf.squeeze(-1).reshape(-1)
@@ -655,6 +652,9 @@ class VGGT_Model_Inference:
                 print(f"[VGGT] Warning: Sky filtering failed: {e}")
                 import traceback
                 traceback.print_exc()
+        
+        # Clean up model_input_np after all filtering operations complete
+        del model_input_np
         
         points = points_all_frames[valid_mask_all]
         colors = colors_all_frames[valid_mask_all]
