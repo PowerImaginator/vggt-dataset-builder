@@ -19,18 +19,30 @@ _vggt_model = None
 _vggt_model_device = None
 
 def get_vggt_model(device_name):
+    """Get VGGT model with proper caching and device management."""
     global _vggt_model, _vggt_model_device
     from vggt.models.vggt import VGGT
     device = torch.device(device_name)
     
     if _vggt_model is None:
+        print("[VGGT] Loading model for the first time...")
         _vggt_model = VGGT.from_pretrained("facebook/VGGT-1B")
         _vggt_model.eval()
+        # Disable gradient computation for inference
+        for param in _vggt_model.parameters():
+            param.requires_grad = False
     
     # Move model to the requested device if it's not already there
     if _vggt_model_device != device_name:
+        print(f"[VGGT] Moving model from {_vggt_model_device} to {device_name}")
+        # Clean up old device memory before moving
+        if _vggt_model_device == "cuda":
+            torch.cuda.empty_cache()
         _vggt_model = _vggt_model.to(device)
         _vggt_model_device = device_name
+        # Clean up after move
+        if device_name == "cuda":
+            torch.cuda.empty_cache()
     
     return _vggt_model
 
@@ -183,10 +195,40 @@ class VGGT_Model_Inference:
         
         return inputs
     
-    @staticmethod
-    def IS_CHANGED(device, image_1=None, **kwargs):
-        """This helps ComfyUI understand when the node has actually changed"""
-        return float("nan")
+    @classmethod
+    def IS_CHANGED(cls, device, image_1=None, **kwargs):
+        """Return a hash of inputs to enable caching when inputs haven't changed"""
+        import hashlib
+        
+        # Create a hash based on all inputs
+        hash_input = hashlib.sha256()
+        
+        # Hash device
+        hash_input.update(device.encode())
+        
+        # Hash all image inputs
+        if image_1 is not None:
+            hash_input.update(image_1.cpu().numpy().tobytes())
+        
+        # Hash additional image inputs from kwargs
+        for i in range(2, 21):
+            image_key = f"image_{i}"
+            if image_key in kwargs and kwargs[image_key] is not None:
+                hash_input.update(kwargs[image_key].cpu().numpy().tobytes())
+        
+        # Hash all configuration parameters
+        config_params = [
+            'depth_conf_threshold', 'gaussian_scale_multiplier', 'preprocess_mode',
+            'mask_black_bg', 'mask_white_bg', 'mask_sky', 'boundary_threshold',
+            'max_depth', 'upsample_depth'
+        ]
+        
+        for param in config_params:
+            if param in kwargs:
+                value = kwargs[param]
+                hash_input.update(str(value).encode())
+        
+        return hash_input.hexdigest()
     
     def get_title(self):
         """Dynamic title that shows how many images are connected"""
@@ -201,6 +243,7 @@ class VGGT_Model_Inference:
     RETURN_NAMES = ("ply_path", "extrinsics", "intrinsics")
     FUNCTION = "infer"
     CATEGORY = "VGGT"
+    OUTPUT_NODE = False  # Not a terminal output node, results are passed to other nodes
 
     def infer(self, device, image_1=None, depth_conf_threshold=50.0, gaussian_scale_multiplier=0.1, preprocess_mode="pad_white", mask_black_bg=False, mask_white_bg=False, mask_sky=False, boundary_threshold=0, max_depth=-1.0, upsample_depth=True, **kwargs):
         # Combine multiple images into a sequence
@@ -270,6 +313,9 @@ class VGGT_Model_Inference:
             model_input = torch.cat(processed_images, dim=0)
             height, width = target_output_dims
             batch_size = len(images_list)
+            
+            # Clean up individual processed images after concatenation
+            del processed_images
         else:
             # Single image
             img = images_list[0]
@@ -283,6 +329,9 @@ class VGGT_Model_Inference:
         
         # Move to device
         model_input = model_input.to(device)
+        
+        # Clean up images_list after preprocessing is complete
+        del images_list
         
         # Flag to indicate if we're using tiling
         using_tiles = preprocess_mode == "tile" and height > width
@@ -321,6 +370,12 @@ class VGGT_Model_Inference:
         )
         predictions["extrinsic"] = extrinsic
         predictions["intrinsic"] = intrinsic
+        
+        # Clean up pose_enc after conversion (large tensor no longer needed)
+        if "pose_enc" in predictions:
+            del predictions["pose_enc"]
+        if device == "cuda":
+            torch.cuda.empty_cache()
 
         # Convert to numpy for colors BEFORE deleting model_input
         # Images are in (N, C, H, W) format from model_input
@@ -379,6 +434,10 @@ class VGGT_Model_Inference:
                     depth_conf_upsampled.append(conf_frame_up.permute(0, 2, 3, 1).squeeze(0).numpy())
                     colors_upsampled.append(color_frame_up.permute(0, 2, 3, 1).squeeze(0).numpy())
                     
+                    # Clean up intermediate tensors immediately
+                    del depth_frame_t, conf_frame_t, color_frame_t
+                    del depth_frame_up, conf_frame_up, color_frame_up
+                    
                     # Adjust intrinsics for upsampled resolution
                     intrinsic_frame = intrinsic_np[frame_idx].copy()
                     current_h, current_w = model_input_np[frame_idx].shape[:2]
@@ -395,6 +454,10 @@ class VGGT_Model_Inference:
                 predictions["depth_conf"] = np.stack(depth_conf_upsampled)  # (S, H_orig, W_orig, 1)
                 model_input_np = np.stack(colors_upsampled)  # (S, H_orig, W_orig, 3)
                 intrinsic_np = np.stack(intrinsic_upsampled)
+                
+                # Clean up temporary upsampling lists
+                del depth_map_upsampled, depth_conf_upsampled, colors_upsampled, intrinsic_upsampled
+                
                 print(f"[VGGT] Upsampled depth to original resolution: {depth_map.shape}")
                 print(f"[VGGT] Upsampled colors to match: {model_input_np.shape}")
             else:
@@ -433,6 +496,9 @@ class VGGT_Model_Inference:
         # Use MODEL INPUT IMAGES (resized to match world points) for colors
         # Keep in [0, 1] range - write_ply_basic handles conversion to SH coefficients
         colors_all_frames = model_input_np.reshape(-1, 3).astype(np.float32)  # (S*H*W, 3) in [0, 1]
+        
+        # Clean up model_input_np after extracting colors
+        del model_input_np
         
         # Flatten confidence scores
         if depth_conf.ndim == 4:
@@ -625,7 +691,7 @@ class VGGT_Model_Inference:
         print(f"  Colors range: [{colors.min():.3f}, {colors.max():.3f}]")
         print(f"  Confidences range: [{confidences.min():.3f}, {confidences.max():.3f}]")
 
-        # Extract first camera's extrinsics and intrinsics for GaussianViewer
+        # Extract first camera's extrinsics and intrinsics BEFORE cleanup
         # Convert numpy arrays to lists for compatibility
         first_extrinsics = extrinsic_np[0].tolist() if extrinsic_np.ndim > 2 and len(extrinsic_np) > 0 else [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0]]
         first_intrinsics = intrinsic_np[0].tolist() if intrinsic_np.ndim > 2 and len(intrinsic_np) > 0 else [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
@@ -637,6 +703,21 @@ class VGGT_Model_Inference:
         print(f"[VGGT]   Intrinsic (3x3 camera calibration):")
         for row in first_intrinsics:
             print(f"[VGGT]     {row}")
+
+        # Clean up memory after point cloud generation
+        print("[VGGT] Cleaning up VRAM...")
+        del points, colors, confidences
+        del points_all_frames, colors_all_frames, conf_all_frames
+        del world_points_batch, depth_conf, depth_map
+        del world_points
+        del predictions
+        del valid_mask_all
+        # Clean up numpy arrays
+        del extrinsic_np, intrinsic_np
+        if device == "cuda":
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        print("[VGGT] VRAM cleanup complete")
 
         return (ply_path, first_extrinsics, first_intrinsics)
 
