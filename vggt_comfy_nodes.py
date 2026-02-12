@@ -124,13 +124,13 @@ class VGGT_Model_Inference:
     
     @classmethod
     def INPUT_TYPES(cls):
-        """Generate input types with only first image required."""
+        """Generate input types with all images optional."""
         inputs = {
             "required": {
-                "image_1": ("IMAGE",),
                 "device": (["cuda", "cpu"], {"default": "cuda"}),
             },
             "optional": {
+                "image_1": ("IMAGE",),
                 "depth_conf_threshold": ("FLOAT", {
                     "default": 50.0,
                     "min": 0.0,
@@ -174,13 +174,17 @@ class VGGT_Model_Inference:
                     "step": 1.0,
                     "tooltip": "Maximum depth value to keep. -1 = no limit"
                 }),
+                "upsample_depth": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Upsample depth/confidence maps to original input resolution for higher quality point clouds"
+                }),
             }
         }
         
         return inputs
     
     @staticmethod
-    def IS_CHANGED(image_1, **kwargs):
+    def IS_CHANGED(device, image_1=None, **kwargs):
         """This helps ComfyUI understand when the node has actually changed"""
         return float("nan")
     
@@ -198,16 +202,24 @@ class VGGT_Model_Inference:
     FUNCTION = "infer"
     CATEGORY = "VGGT"
 
-    def infer(self, image_1, device, depth_conf_threshold=50.0, gaussian_scale_multiplier=0.1, preprocess_mode="pad_white", mask_black_bg=False, mask_white_bg=False, mask_sky=False, boundary_threshold=0, max_depth=-1.0, **kwargs):
+    def infer(self, device, image_1=None, depth_conf_threshold=50.0, gaussian_scale_multiplier=0.1, preprocess_mode="pad_white", mask_black_bg=False, mask_white_bg=False, mask_sky=False, boundary_threshold=0, max_depth=-1.0, upsample_depth=True, **kwargs):
         # Combine multiple images into a sequence
-        # Dynamically collect all connected image inputs from image_2 onwards
-        images_list = [image_1]
+        # Dynamically collect all connected image inputs from image_1 onwards
+        images_list = []
+        
+        # Add image_1 if provided
+        if image_1 is not None:
+            images_list.append(image_1)
         
         # Extract connected images from kwargs (image_2, image_3, etc.)
         for i in range(2, 21):
             image_key = f"image_{i}"
             if image_key in kwargs and kwargs[image_key] is not None:
                 images_list.append(kwargs[image_key])
+        
+        # Check if any images are provided
+        if not images_list:
+            raise ValueError("[VGGT] No images provided. Please connect at least one image input.")
         
         print(f"[VGGT] Detected {len(images_list)} connected image input(s)")
         
@@ -218,6 +230,9 @@ class VGGT_Model_Inference:
         import torch.nn.functional as F
         target_size = 518
         
+        # Store original dimensions for potential upsampling
+        original_dims = []
+        
         if len(images_list) > 1:
             print(f"[VGGT] Processing {len(images_list)} images as sequence")
             # Preprocess each image separately first
@@ -226,6 +241,8 @@ class VGGT_Model_Inference:
             
             for img_idx, img_tensor in enumerate(images_list):
                 batch_size, height, width, channels = img_tensor.shape
+                # Store original dimensions
+                original_dims.append((height, width))
                 
                 # Convert to (B, C, H, W)
                 model_input = img_tensor.permute(0, 3, 1, 2)
@@ -255,8 +272,11 @@ class VGGT_Model_Inference:
             batch_size = len(images_list)
         else:
             # Single image
-            batch_size, height, width, channels = image_1.shape
-            model_input = image_1.permute(0, 3, 1, 2)
+            img = images_list[0]
+            batch_size, height, width, channels = img.shape
+            # Store original dimensions
+            original_dims.append((height, width))
+            model_input = img.permute(0, 3, 1, 2)
             model_input, height, width = self._preprocess_image_to_dims(
                 model_input, height, width, target_size, preprocess_mode
             )
@@ -316,8 +336,75 @@ class VGGT_Model_Inference:
         # Generate world points from depth map - EXACTLY like demo does
         print("[VGGT] Computing world points from depth map (depth-based unprojection)...")
         depth_map = predictions["depth"]  # (S, H, W, 1)
+        
+        # Initialize intrinsic_np with original values
+        intrinsic_np = predictions["intrinsic"]  # (S, 3, 3)
+        
+        # ===== UPSAMPLE DEPTH IF REQUESTED =====
+        if upsample_depth and len(original_dims) > 0:
+            # Check if all images have the same resolution
+            all_same_resolution = all(dim == original_dims[0] for dim in original_dims)
+            
+            if all_same_resolution:
+                print("[VGGT] Upsampling depth and confidence maps to original resolution...")
+                depth_map_upsampled = []
+                depth_conf_upsampled = []
+                colors_upsampled = []
+                intrinsic_upsampled = []
+                
+                for frame_idx, (orig_height, orig_width) in enumerate(original_dims):
+                    # Extract this frame's depth and confidence
+                    depth_frame = depth_map[frame_idx]  # (H, W, 1) or (H, W)
+                    conf_frame = predictions["depth_conf"][frame_idx]  # (H, W, 1) or (H, W)
+                    color_frame = model_input_np[frame_idx]  # (H, W, 3)
+                    
+                    # Ensure they have proper dimensions
+                    if depth_frame.ndim == 2:
+                        depth_frame = np.expand_dims(depth_frame, -1)  # (H, W, 1)
+                    if conf_frame.ndim == 2:
+                        conf_frame = np.expand_dims(conf_frame, -1)  # (H, W, 1)
+                    
+                    # Add batch dimension for interpolation: (H, W, C) -> (1, C, H, W)
+                    depth_frame_t = torch.from_numpy(depth_frame).permute(2, 0, 1).unsqueeze(0).float()
+                    conf_frame_t = torch.from_numpy(conf_frame).permute(2, 0, 1).unsqueeze(0).float()
+                    color_frame_t = torch.from_numpy(color_frame).permute(2, 0, 1).unsqueeze(0).float()
+                    
+                    # Upsample to original resolution
+                    depth_frame_up = F.interpolate(depth_frame_t, size=(orig_height, orig_width), mode='bicubic', align_corners=False)
+                    conf_frame_up = F.interpolate(conf_frame_t, size=(orig_height, orig_width), mode='nearest')
+                    color_frame_up = F.interpolate(color_frame_t, size=(orig_height, orig_width), mode='bicubic', align_corners=False)
+                    
+                    # Convert back to numpy: (1, C, H, W) -> (H, W, C)
+                    depth_map_upsampled.append(depth_frame_up.permute(0, 2, 3, 1).squeeze(0).numpy())
+                    depth_conf_upsampled.append(conf_frame_up.permute(0, 2, 3, 1).squeeze(0).numpy())
+                    colors_upsampled.append(color_frame_up.permute(0, 2, 3, 1).squeeze(0).numpy())
+                    
+                    # Adjust intrinsics for upsampled resolution
+                    intrinsic_frame = intrinsic_np[frame_idx].copy()
+                    current_h, current_w = model_input_np[frame_idx].shape[:2]
+                    scale_h = orig_height / current_h
+                    scale_w = orig_width / current_w
+                    intrinsic_frame[0, 0] *= scale_w  # fx
+                    intrinsic_frame[1, 1] *= scale_h  # fy
+                    intrinsic_frame[0, 2] *= scale_w  # cx
+                    intrinsic_frame[1, 2] *= scale_h  # cy
+                    intrinsic_upsampled.append(intrinsic_frame)
+                
+                # Stack upsampled arrays
+                depth_map = np.stack(depth_map_upsampled)  # (S, H_orig, W_orig, 1)
+                predictions["depth_conf"] = np.stack(depth_conf_upsampled)  # (S, H_orig, W_orig, 1)
+                model_input_np = np.stack(colors_upsampled)  # (S, H_orig, W_orig, 3)
+                intrinsic_np = np.stack(intrinsic_upsampled)
+                print(f"[VGGT] Upsampled depth to original resolution: {depth_map.shape}")
+                print(f"[VGGT] Upsampled colors to match: {model_input_np.shape}")
+            else:
+                print(f"[VGGT] ⚠️ WARNING: Multiple images have different resolutions, skipping upsampling:")
+                for idx, (h, w) in enumerate(original_dims):
+                    print(f"[VGGT]   Image {idx+1}: {w}x{h}")
+                print(f"[VGGT] To use upsampling, provide images with the same resolution")
+        
         world_points = unproject_depth_map_to_point_map(
-            depth_map, predictions["extrinsic"], predictions["intrinsic"]
+            depth_map, predictions["extrinsic"], intrinsic_np
         )
         predictions["world_points_from_depth"] = world_points
 
@@ -332,7 +419,7 @@ class VGGT_Model_Inference:
         depth_conf = predictions["depth_conf"]
         
         extrinsic_np = predictions["extrinsic"]  # (S, 3, 4)
-        intrinsic_np = predictions["intrinsic"]  # (S, 3, 3)
+        # intrinsic_np already set above (either upsampled or original)
         
         print(f"[VGGT] Point cloud generation:")
         print(f"[VGGT]   World points shape: {world_points_batch.shape}")
@@ -420,9 +507,15 @@ class VGGT_Model_Inference:
                 import cv2
                 import onnxruntime as ort
                 from pathlib import Path
+                import folder_paths
+                
+                # Use ComfyUI's models directory for caching
+                models_dir = Path(folder_paths.models_dir)
+                cache_dir = models_dir / "vggt"
+                cache_dir.mkdir(parents=True, exist_ok=True)
                 
                 # Initialize sky segmentation session (lazy loading)
-                skyseg_model_path = Path(__file__).parent / "skyseg.onnx"
+                skyseg_model_path = cache_dir / "skyseg.onnx"
                 if not skyseg_model_path.exists():
                     print(f"[VGGT] Downloading sky segmentation model to {skyseg_model_path}...")
                     import urllib.request
@@ -552,19 +645,18 @@ class VGGT_Model_Inference:
         import torch.nn.functional as F
         
         if preprocess_mode == "crop":
-            # Demo mode: resize to width=518px maintaining aspect ratio
-            # IMPORTANT: For tall/square images, this will CENTER-CROP the height to 518px,
-            # which LOSES top and bottom information. Use "pad" mode to preserve all pixels.
-            new_width = target_size
-            new_height = round(height * (new_width / width) / 14) * 14
+            # Demo mode: resize to fit within 518px, maintaining aspect ratio
+            # Handles both landscape and portrait images without cropping content
+            if width >= height:
+                # Landscape or square: constrain by width
+                new_width = target_size
+                new_height = round(height * (new_width / width) / 14) * 14
+            else:
+                # Portrait: constrain by height
+                new_height = target_size
+                new_width = round(width * (new_height / height) / 14) * 14
             
             model_input = F.interpolate(model_input, size=(new_height, new_width), mode='bicubic', align_corners=False)
-            
-            # Center crop height ONLY if > 518 (loses top/bottom info for tall images)
-            if new_height > target_size:
-                start_y = (new_height - target_size) // 2
-                model_input = model_input[:, :, start_y:start_y + target_size, :]
-                new_height = target_size
             
             return model_input, new_height, new_width
             
