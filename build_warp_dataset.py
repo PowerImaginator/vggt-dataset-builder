@@ -13,6 +13,7 @@ import torch
 import torch.nn.functional as torch_nn
 from PIL import Image
 import pillow_heif
+import hashlib
 
 from vggt.models.vggt import VGGT
 from vggt.utils.geometry import unproject_depth_map_to_point_map
@@ -24,6 +25,7 @@ try:
     import cv2
     import onnxruntime
     from vggt.visual_util import segment_sky, download_file_from_url
+
     SKY_FILTER_AVAILABLE = True
 except ImportError:
     SKY_FILTER_AVAILABLE = False
@@ -32,8 +34,20 @@ except ImportError:
 
 pillow_heif.register_heif_opener()
 
-SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".heic", ".heif"}
+SUPPORTED_EXTENSIONS = {
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".bmp",
+    ".tif",
+    ".tiff",
+    ".heic",
+    ".heif",
+}
 
+# Local cache directory (per-repo)
+CACHE_DIR = Path(__file__).resolve().parent / ".cache"
+MODEL_ID = "facebook/VGGT-1B"
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -180,6 +194,21 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Generate bidirectional pairs (A->B and B->A) for each consecutive frame pair (default: off).",
     )
+    parser.add_argument(
+        "--force_output",
+        action="store_true",
+        help="Force recalculation and overwrite existing output files (affects outputs).",
+    )
+    parser.add_argument(
+        "--nocache",
+        action="store_true",
+        help="Disable on-disk per-frame caching (default: off).",
+    )
+    parser.add_argument(
+        "--clear-cache",
+        action="store_true",
+        help="Clear the on-disk cache directory (.cache) before running (default: off).",
+    )
     return parser.parse_args()
 
 
@@ -190,7 +219,7 @@ def write_ply(
     confidences: np.ndarray | None = None,
 ) -> None:
     """Write point cloud to binary PLY file.
-    
+
     Args:
         output_path: Path to output PLY file
         points: Nx3 array of 3D points
@@ -198,10 +227,10 @@ def write_ply(
         confidences: Optional Nx1 array of confidence values
     """
     num_points = points.shape[0]
-    
+
     # Convert colors from 0-1 to 0-255 range
     colors_uint8 = (colors * 255).astype(np.uint8)
-    
+
     # Write header as text
     header = "ply\n"
     header += "format binary_little_endian 1.0\n"
@@ -215,31 +244,35 @@ def write_ply(
     if confidences is not None:
         header += "property float confidence\n"
     header += "end_header\n"
-    
-    with open(output_path, 'wb') as f:
+
+    with open(output_path, "wb") as f:
         # Write header
-        f.write(header.encode('ascii'))
-        
+        f.write(header.encode("ascii"))
+
         # ⚡ Bolt: Bulk binary writing with NumPy structured array
         # This is significantly faster than a Python loop with struct.pack
         # for large point clouds (e.g. 1M points).
         dtype = [
-            ('x', '<f4'), ('y', '<f4'), ('z', '<f4'),
-            ('red', 'u1'), ('green', 'u1'), ('blue', 'u1')
+            ("x", "<f4"),
+            ("y", "<f4"),
+            ("z", "<f4"),
+            ("red", "u1"),
+            ("green", "u1"),
+            ("blue", "u1"),
         ]
         if confidences is not None:
-            dtype.append(('confidence', '<f4'))
+            dtype.append(("confidence", "<f4"))
 
         vertex_data = np.empty(num_points, dtype=dtype)
-        vertex_data['x'] = points[:, 0]
-        vertex_data['y'] = points[:, 1]
-        vertex_data['z'] = points[:, 2]
-        vertex_data['red'] = colors_uint8[:, 0]
-        vertex_data['green'] = colors_uint8[:, 1]
-        vertex_data['blue'] = colors_uint8[:, 2]
+        vertex_data["x"] = points[:, 0]
+        vertex_data["y"] = points[:, 1]
+        vertex_data["z"] = points[:, 2]
+        vertex_data["red"] = colors_uint8[:, 0]
+        vertex_data["green"] = colors_uint8[:, 1]
+        vertex_data["blue"] = colors_uint8[:, 2]
         if confidences is not None:
             # Handle both (N,) and (N, 1) confidence arrays
-            vertex_data['confidence'] = confidences.ravel()
+            vertex_data["confidence"] = confidences.ravel()
 
         f.write(vertex_data.tobytes())
 
@@ -252,23 +285,25 @@ def apply_sky_filter(
 ) -> np.ndarray:
     """Apply sky segmentation to filter confidence scores."""
     if not SKY_FILTER_AVAILABLE:
-        print("Warning: Sky filtering requires opencv-python and onnxruntime. Skipping.")
+        print(
+            "Warning: Sky filtering requires opencv-python and onnxruntime. Skipping."
+        )
         return conf_frame
-    
+
     sky_masks_dir.mkdir(parents=True, exist_ok=True)
     image_name = image_path.name
     mask_path = sky_masks_dir / image_name
-    
+
     if mask_path.exists():
         sky_mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
     else:
         sky_mask = segment_sky(str(image_path), skyseg_session, str(mask_path))
-    
+
     # Resize mask to match confidence map if needed
     H, W = conf_frame.shape
     if sky_mask.shape[0] != H or sky_mask.shape[1] != W:
         sky_mask = cv2.resize(sky_mask, (W, H))
-    
+
     # Apply mask (segment_sky returns 255 for non-sky, 0 for sky)
     sky_mask_binary = (sky_mask > 128).astype(np.float32)
     return conf_frame * sky_mask_binary
@@ -280,12 +315,12 @@ def apply_background_filters(
     filter_white: bool,
 ) -> np.ndarray:
     """Apply black and/or white background filtering.
-    
+
     Args:
         colors: Nx3 array of RGB colors (0-1 range)
         filter_black: Filter black background
         filter_white: Filter white background
-    
+
     Returns:
         Boolean mask of valid points
     """
@@ -297,14 +332,18 @@ def apply_background_filters(
     # and redundant computations for black/white filtering.
     if filter_black:
         # RGB sum < 16/255 approx 0.0627 in 0-1 float range
-        mask &= (colors.sum(axis=1) >= (16 / 255.0))
-    
+        mask &= colors.sum(axis=1) >= (16 / 255.0)
+
     if filter_white:
         # ⚡ Bolt: floor(c * 255) > 240  <=>  c * 255 >= 241  <=>  c >= 241/255
         # This avoids creating an expensive floor copy and multiple mask arrays.
         threshold = 241.0 / 255.0
-        mask &= ~((colors[:, 0] >= threshold) & (colors[:, 1] >= threshold) & (colors[:, 2] >= threshold))
-    
+        mask &= ~(
+            (colors[:, 0] >= threshold)
+            & (colors[:, 1] >= threshold)
+            & (colors[:, 2] >= threshold)
+        )
+
     return mask
 
 
@@ -365,9 +404,7 @@ def rescale_scene_images_to_max_megapixels(
     resized_paths: list[Path] = []
     resized_count = 0
     for path in image_paths:
-        resized_path = rescale_image_to_max_megapixels(
-            path, max_megapixels, temp_dir
-        )
+        resized_path = rescale_image_to_max_megapixels(path, max_megapixels, temp_dir)
         if resized_path != path:
             resized_count += 1
         resized_paths.append(resized_path)
@@ -806,6 +843,93 @@ def get_triplet_paths(
     }
 
 
+def _cache_file_for_image(scene_cache_dir: Path, image_path: Path) -> Path:
+    return scene_cache_dir / f"{image_path.stem}.npz"
+
+
+def _image_signature(path: Path) -> str:
+    """Compute a robust signature for an image file.
+
+    This uses a SHA1 of the file contents for strong invalidation. On error,
+    return an empty string so the cache will be treated as invalid.
+    """
+    try:
+        h = hashlib.sha1()
+        with path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(8192), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return ""
+
+
+def _make_args_hash(args: argparse.Namespace, resize_size: tuple[int, int] | None) -> str:
+    key = {
+        "preprocess_mode": args.preprocess_mode,
+        "max_megapixels": float(args.max_megapixels),
+        "filter_sky": bool(args.filter_sky),
+        "filter_black_bg": bool(args.filter_black_bg),
+        "filter_white_bg": bool(args.filter_white_bg),
+        "upsample_depth": bool(args.upsample_depth),
+        "resize_size": list(resize_size) if resize_size is not None else None,
+        "save_confidence": bool(args.save_confidence),
+        "auto_s0": bool(args.auto_s0),
+        "sigma": float(args.sigma),
+        "depth_conf_threshold": float(args.depth_conf_threshold),
+        "model_id": MODEL_ID,
+    }
+    payload = json.dumps(key, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+
+def save_frame_cache(cache_path: Path, frame_data: dict) -> None:
+    """Save a single frame's point-cloud data to a compressed .npz file.
+
+    Stored arrays: points, colors, confidences. Optional: s0 (float), conf_image (uint8 array).
+    """
+    save_kwargs = {}
+    arrs = {
+        "points": frame_data["points"],
+        "colors": frame_data["colors"],
+        "confidences": frame_data["confidences"],
+    }
+    s0 = frame_data.get("s0")
+    if s0 is not None:
+        arrs["s0"] = np.array(float(s0))
+    conf_image = frame_data.get("conf_image")
+    if conf_image is not None:
+        arrs["conf_image"] = np.array(conf_image, dtype=np.uint8)
+
+    # Ensure parent dir exists
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(cache_path, **arrs)
+
+
+def load_frame_cache(cache_path: Path) -> dict | None:
+    """Load cached frame data from .npz if available.
+
+    Returns a frame_data dict compatible with in-memory format or None on error.
+    """
+    try:
+        data = np.load(cache_path, allow_pickle=False)
+    except Exception:
+        return None
+
+    try:
+        frame_data = {
+            "points": data["points"],
+            "colors": data["colors"],
+            "confidences": data["confidences"],
+        }
+        if "s0" in data:
+            frame_data["s0"] = float(data["s0"].tolist())
+        if "conf_image" in data:
+            frame_data["conf_image"] = Image.fromarray(data["conf_image"].astype(np.uint8))
+        return frame_data
+    except Exception:
+        return None
+
+
 def check_scene_needs_processing(
     scene_dir: Path,
     output_dir: Path,
@@ -814,46 +938,82 @@ def check_scene_needs_processing(
     save_confidence: bool,
     save_ply: bool,
     image_paths: list[Path],
+    args: argparse.Namespace,
+    resize_size: tuple[int, int] | None,
+    force: bool = False,
 ) -> bool:
     """Check if this scene needs any processing.
-    
+
     Returns True if any pair is missing files, False if all pairs complete.
     """
+    if force:
+        return True
+
     if len(image_paths) < 2:
         return False
-    
+
     scene_output_dir = output_dir / scene_dir.name
     scene_output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Cache setup (per-repo .cache/<scene>)
+    cache_enabled = not args.nocache
+    scene_cache_dir = CACHE_DIR / scene_dir.name
+    manifest_path = scene_cache_dir / "manifest.json"
+    manifest_images: dict = {}
+    manifest_args_hash: str | None = None
+    args_hash = _make_args_hash(args, resize_size)
+    if cache_enabled:
+        # Ensure cache dir exists
+        scene_cache_dir.mkdir(parents=True, exist_ok=True)
+        # Load manifest and validate args_hash; invalidate if mismatch
+        try:
+            if manifest_path.exists():
+                with manifest_path.open("r", encoding="utf-8") as fh:
+                    manifest = json.load(fh)
+                manifest_args_hash = manifest.get("args_hash")
+                manifest_images = manifest.get("images", {}) or {}
+                if manifest_args_hash != args_hash:
+                    # Invalidate cache dir
+                    try:
+                        shutil.rmtree(scene_cache_dir)
+                    except Exception:
+                        pass
+                    scene_cache_dir.mkdir(parents=True, exist_ok=True)
+                    manifest_images = {}
+        except Exception:
+            manifest_images = {}
+
     
+
     for idx in range(len(image_paths) - 1):
         next_idx = idx + 1
         next_name = image_paths[next_idx].stem
         curr_name = image_paths[idx].stem
-        
+
         # Check both original and rescaled versions of the filename
         def files_exist_for_name(name: str) -> bool:
             for stem in [name, f"{name}_rescaled"]:
                 paths = get_triplet_paths(scene_output_dir, stem, output_ext)
                 files_ok = (
-                    paths["splats"].exists() and
-                    paths["target"].exists() and
-                    paths["reference"].exists() and
-                    (not save_confidence or paths["confidence"].exists()) and
-                    (not save_ply or paths["ply"].exists())
+                    paths["splats"].exists()
+                    and paths["target"].exists()
+                    and paths["reference"].exists()
+                    and (not save_confidence or paths["confidence"].exists())
+                    and (not save_ply or paths["ply"].exists())
                 )
                 if files_ok:
                     return True
             return False
-        
+
         # Check forward direction files
         if not files_exist_for_name(next_name):
             return True  # Forward direction needs work
-        
+
         # Check reverse direction if bidirectional
         if bidirectional:
             if not files_exist_for_name(curr_name):
                 return True  # Reverse direction needs work
-    
+
     return False  # All pairs complete
 
 
@@ -899,10 +1059,7 @@ def render_and_save_pair(
     output_ext: str,
     save_kwargs: dict,
     args: argparse.Namespace,
-    depth: np.ndarray,
-    depth_conf: np.ndarray,
-    world_points: np.ndarray,
-    images_np: np.ndarray,
+    frame_data: dict,
     extrinsic: np.ndarray,
     intrinsic: np.ndarray,
     preprocess_metas: list[dict],
@@ -910,7 +1067,6 @@ def render_and_save_pair(
     render_width: int,
     render_height: int,
     resize_size: tuple[int, int] | None,
-    skyseg_session,
 ) -> None:
     """Render and save a single image pair (source -> target)."""
     target_name = image_paths[target_idx].stem
@@ -923,7 +1079,8 @@ def render_and_save_pair(
     ply_path = paths["ply"]
 
     missing = (
-        not splats_path.exists()
+        args.force_output
+        or not splats_path.exists()
         or not target_path.exists()
         or not reference_path.exists()
         or (args.save_confidence and not conf_path.exists())
@@ -936,39 +1093,14 @@ def render_and_save_pair(
         )
         return
 
-    depth_frame = depth[source_idx]
-    conf_frame = depth_conf[source_idx]
-    if depth_frame.ndim == 3:
-        depth_frame = depth_frame.squeeze(-1)
-    if conf_frame.ndim == 3:
-        conf_frame = conf_frame.squeeze(-1)
+    # ⚡ Bolt: Use pre-calculated frame data to avoid redundant filtering and extraction
+    points = frame_data["points"]
+    colors = frame_data["colors"]
+    confidences = frame_data["confidences"]
+    s0 = frame_data.get("s0", 0.0)
 
-    # Apply sky filtering if enabled
-    if args.filter_sky and skyseg_session is not None:
-        sky_masks_dir = scene_output_dir / "sky_masks"
-        conf_frame = apply_sky_filter(
-            conf_frame, image_paths[source_idx], skyseg_session, sky_masks_dir
-        )
-
-    valid_mask = depth_frame > 1e-6
-
-    points = world_points[source_idx][valid_mask]
-    colors = images_np[source_idx][valid_mask]
-    confidences = conf_frame[valid_mask]
-
-    # Apply background filtering if enabled
-    if args.filter_black_bg or args.filter_white_bg:
-        bg_mask = apply_background_filters(
-            colors, args.filter_black_bg, args.filter_white_bg
-        )
-        points = points[bg_mask]
-        colors = colors[bg_mask]
-        confidences = confidences[bg_mask]
-
-    if args.auto_s0:
-        s0 = estimate_s0_from_depth(depth_frame, intrinsic[source_idx])
-        if s0 > 0.0:
-            renderer.s0 = s0
+    if args.auto_s0 and s0 > 0.0:
+        renderer.s0 = s0
 
     view_mat = build_view_matrix(extrinsic[target_idx])
     if args.upsample_depth:
@@ -994,35 +1126,11 @@ def render_and_save_pair(
         Image.fromarray(splats_image).save(splats_path, **save_kwargs)
 
     if args.save_confidence and not conf_path.exists():
-        # Save confidence map for the source frame (source_idx) as grayscale
-        conf_for_save = conf_frame.copy()
-        # Normalize to 0-255 range
-        conf_min = conf_for_save.min()
-        conf_max = conf_for_save.max()
-        if conf_max > conf_min:
-            conf_normalized = (conf_for_save - conf_min) / (conf_max - conf_min)
-        else:
-            conf_normalized = np.zeros_like(conf_for_save)
-        conf_uint8 = (conf_normalized * 255).astype(np.uint8)
-        if not args.upsample_depth and resize_size is None:
-            # Restore to original resolution
-            conf_image = Image.fromarray(conf_uint8, mode="L")
-            meta = preprocess_metas[source_idx]
-            left = int(meta["total_pad_left"])
-            top = int(meta["total_pad_top"])
-            right = left + int(meta["effective_width"])
-            bottom = top + int(meta["effective_height"])
-            conf_image = conf_image.crop((left, top, right, bottom))
-            conf_image = conf_image.resize(
-                (int(meta["orig_width"]), int(meta["orig_height"])),
-                Image.Resampling.BICUBIC,
-            )
-        else:
-            conf_image = Image.fromarray(conf_uint8, mode="L")
-            if resize_size is not None:
-                conf_image = conf_image.resize(resize_size, Image.Resampling.BICUBIC)
-        # Always save confidence as PNG for lossless grayscale
-        conf_image.save(conf_path)
+        # ⚡ Bolt: Use pre-calculated confidence image
+        conf_image = frame_data.get("conf_image")
+        if conf_image is not None:
+            # Always save confidence as PNG for lossless grayscale
+            conf_image.save(conf_path)
 
     if not target_path.exists() or not reference_path.exists():
         target_img_obj = Image.open(image_paths[target_idx])
@@ -1096,6 +1204,9 @@ def process_scene(
         args.save_confidence,
         args.save_ply,
         image_paths,
+        args,
+        resize_size,
+        force=args.force_output,
     )
 
     if not scene_needs_work:
@@ -1274,6 +1385,146 @@ def process_scene(
             depth_for_unproject, extrinsic, intrinsic
         )
 
+        # Cache setup (per-repo .cache/<scene>)
+        cache_enabled = not args.nocache
+        scene_cache_dir = CACHE_DIR / scene_dir.name
+        manifest_path = scene_cache_dir / "manifest.json"
+        manifest_images: dict = {}
+        manifest_args_hash: str | None = None
+        args_hash = _make_args_hash(args, resize_size)
+        if cache_enabled:
+            # Ensure cache dir exists
+            scene_cache_dir.mkdir(parents=True, exist_ok=True)
+            # Load manifest and validate args_hash; invalidate if mismatch
+            try:
+                if manifest_path.exists():
+                    with manifest_path.open("r", encoding="utf-8") as fh:
+                        manifest = json.load(fh)
+                    manifest_args_hash = manifest.get("args_hash")
+                    manifest_images = manifest.get("images", {}) or {}
+                    if manifest_args_hash != args_hash:
+                        # Invalidate cache dir
+                        try:
+                            shutil.rmtree(scene_cache_dir)
+                        except Exception:
+                            pass
+                        scene_cache_dir.mkdir(parents=True, exist_ok=True)
+                        manifest_images = {}
+            except Exception:
+                manifest_images = {}
+
+        # ⚡ Bolt: Pre-calculate and cache filtered point cloud data once per frame.
+        # This avoids redundant expensive extraction and filtering in the rendering loop.
+        frame_data_cache = []
+        print(f"Pre-calculating point cloud data for {len(image_paths)} frames...")
+        for idx in range(len(image_paths)):
+            # Try to load cached frame data first (unless forced/nocache)
+            cache_path = _cache_file_for_image(scene_cache_dir, image_paths[idx])
+            if cache_enabled and not args.force_output and cache_path.exists():
+                # Validate image signature against manifest before loading
+                try:
+                    sig = _image_signature(image_paths[idx])
+                    cached_sig = manifest_images.get(image_paths[idx].stem)
+                    if cached_sig == sig:
+                        cached = load_frame_cache(cache_path)
+                        if cached is not None:
+                            frame_data_cache.append(cached)
+                            continue
+                except Exception:
+                    pass
+
+            depth_frame = depth[idx]
+            conf_frame = depth_conf[idx]
+            if depth_frame.ndim == 3:
+                depth_frame = depth_frame.squeeze(-1)
+            if conf_frame.ndim == 3:
+                conf_frame = conf_frame.squeeze(-1)
+
+            # Apply sky filtering if enabled
+            if args.filter_sky and skyseg_session is not None:
+                sky_masks_dir = scene_output_dir / "sky_masks"
+                conf_frame = apply_sky_filter(
+                    conf_frame, image_paths[idx], skyseg_session, sky_masks_dir
+                )
+
+            valid_mask = depth_frame > 1e-6
+            points = world_points[idx][valid_mask]
+            colors = images_np[idx][valid_mask]
+            confidences = conf_frame[valid_mask]
+
+            # Apply background filtering if enabled
+            if args.filter_black_bg or args.filter_white_bg:
+                bg_mask = apply_background_filters(
+                    colors, args.filter_black_bg, args.filter_white_bg
+                )
+                points = points[bg_mask]
+                colors = colors[bg_mask]
+                confidences = confidences[bg_mask]
+
+            frame_data = {
+                "points": points,
+                "colors": colors,
+                "confidences": confidences,
+            }
+
+            if args.auto_s0:
+                frame_data["s0"] = estimate_s0_from_depth(depth_frame, intrinsic[idx])
+
+            if args.save_confidence:
+                # Normalize to 0-255 range
+                conf_min = conf_frame.min()
+                conf_max = conf_frame.max()
+                if conf_max > conf_min:
+                    conf_normalized = (conf_frame - conf_min) / (conf_max - conf_min)
+                else:
+                    conf_normalized = np.zeros_like(conf_frame)
+                conf_uint8 = (conf_normalized * 255).astype(np.uint8)
+
+                if not args.upsample_depth and resize_size is None:
+                    # Restore to original resolution
+                    conf_image = Image.fromarray(conf_uint8, mode="L")
+                    meta = preprocess_metas[idx]
+                    left = int(meta["total_pad_left"])
+                    top = int(meta["total_pad_top"])
+                    right = left + int(meta["effective_width"])
+                    bottom = top + int(meta["effective_height"])
+                    conf_image = conf_image.crop((left, top, right, bottom))
+                    conf_image = conf_image.resize(
+                        (int(meta["orig_width"]), int(meta["orig_height"])),
+                        Image.Resampling.BICUBIC,
+                    )
+                else:
+                    conf_image = Image.fromarray(conf_uint8, mode="L")
+                    if resize_size is not None:
+                        conf_image = conf_image.resize(
+                            resize_size, Image.Resampling.BICUBIC
+                        )
+                frame_data["conf_image"] = conf_image
+
+            # Save to cache if enabled, and update manifest
+            if cache_enabled and not args.force_output:
+                try:
+                    save_frame_cache(cache_path, frame_data)
+                    manifest_images[image_paths[idx].stem] = _image_signature(image_paths[idx])
+                    try:
+                        with manifest_path.open("w", encoding="utf-8") as fh:
+                            json.dump({"args_hash": args_hash, "images": manifest_images}, fh)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+            frame_data_cache.append(frame_data)
+
+        # ⚡ Bolt: Explicitly delete large arrays after pre-calculation to free memory.
+        del depth
+        del depth_conf
+        del world_points
+        del images_np
+        del depth_for_unproject
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
         save_kwargs = {"quality": 95, "optimize": True} if output_ext == "jpg" else {}
 
         for idx in range(len(image_paths) - 1):
@@ -1288,10 +1539,7 @@ def process_scene(
                 output_ext,
                 save_kwargs,
                 args,
-                depth,
-                depth_conf,
-                world_points,
-                images_np,
+                frame_data_cache[idx],
                 extrinsic,
                 intrinsic,
                 preprocess_metas,
@@ -1299,7 +1547,6 @@ def process_scene(
                 render_width,
                 render_height,
                 resize_size,
-                skyseg_session,
             )
 
             # Reverse: next_idx -> idx
@@ -1312,10 +1559,7 @@ def process_scene(
                     output_ext,
                     save_kwargs,
                     args,
-                    depth,
-                    depth_conf,
-                    world_points,
-                    images_np,
+                    frame_data_cache[next_idx],
                     extrinsic,
                     intrinsic,
                     preprocess_metas,
@@ -1323,19 +1567,14 @@ def process_scene(
                     render_width,
                     render_height,
                     resize_size,
-                    skyseg_session,
                 )
 
         # Explicit cleanup
         del images
         del predictions
-        del depth
-        del depth_for_unproject
-        del depth_conf
         del extrinsic
         del intrinsic
-        del images_np
-        del world_points
+        del frame_data_cache
         del preprocess_metas
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -1403,6 +1642,23 @@ def main() -> None:
                 )
             skyseg_session = onnxruntime.InferenceSession("skyseg.onnx")
 
+    # Handle explicit cache clearing request
+    if args.clear_cache:
+        if CACHE_DIR.exists():
+            try:
+                shutil.rmtree(CACHE_DIR)
+                print(f"Cleared cache directory: {CACHE_DIR}")
+            except Exception:
+                print(f"Warning: failed to clear cache directory: {CACHE_DIR}")
+        else:
+            print(f"Cache directory not present: {CACHE_DIR}")
+
+    # Ensure cache dir exists for later operations
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
     for scene_dir in scene_dirs:
         process_scene(
             scene_dir,
@@ -1415,6 +1671,7 @@ def main() -> None:
             output_dir,
             resize_size,
         )
+
 
 
 if __name__ == "__main__":
