@@ -1,3 +1,7 @@
+# vggt-dataset-builder
+
+Note that there is a more well maintained fork available here: https://github.com/bmaltais/vggt-dataset-builder
+
 ## Dataset builder
 
 - Make sure to clone this repo with `git clone --recurse-submodules`
