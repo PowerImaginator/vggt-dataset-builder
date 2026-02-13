@@ -13,7 +13,15 @@ layout(location = 0) out float o_visibility;
 in vec2 v_tex_coord;
 
 float occlusion_value(vec3 x, vec3 y) {
-	return 1.0 - dot((y - x) / length(y - x), -y / length(y));
+	vec3 d = y - x;
+	float d_len = length(d);
+	float y_len = length(y);
+	if (d_len < 1e-6 || y_len < 1e-6) {
+		return 1.0;
+	}
+	float cosine = dot(d / d_len, -y / y_len);
+	cosine = clamp(cosine, -1.0, 1.0);
+	return 1.0 - cosine;
 }
 
 bool is_background(vec4 cam_pos) {
@@ -30,7 +38,6 @@ void main(void) {
 	}
 	vec3 x = x_v4.xyz;
 
-	ivec2 coord_coarse = coord_base >> u_coarse_level;
 	vec3 cam_coarse = texture(u_tex_cam_pos_levels[u_coarse_level], v_tex_coord).xyz;
 	float z_i = max(1e-6, -cam_coarse.z);
 
@@ -55,6 +62,10 @@ void main(void) {
 
 			ivec2 coord_L = coord_base >> L;
 			ivec2 coord_sample = coord_L + dirs[s];
+			ivec2 size_L = textureSize(u_tex_cam_pos_levels[L], 0);
+			if (coord_sample.x < 0 || coord_sample.y < 0 || coord_sample.x >= size_L.x || coord_sample.y >= size_L.y) {
+				continue;
+			}
 
 			vec4 y_v4 = texelFetch(u_tex_cam_pos_levels[L], coord_sample, 0);
 			if (is_background(y_v4)) {
@@ -63,6 +74,9 @@ void main(void) {
 			vec3 y = y_v4.xyz;
 
 			float occ = occlusion_value(x, y);
+			if (isnan(occ) || isinf(occ)) {
+				continue;
+			}
 			if (!found || occ < best_occ) {
 				best_occ = occ;
 				found = true;

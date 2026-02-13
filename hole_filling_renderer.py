@@ -29,6 +29,7 @@ class HoleFillingRenderer:
         occlusion_threshold: float = 0.1,
         coarse_level: int = 4,
         jfa_mask_sigma: float = 32.0,
+        ctx: moderngl.Context | None = None,
     ) -> None:
         self.width = int(width)
         self.height = int(height)
@@ -38,7 +39,7 @@ class HoleFillingRenderer:
         self.coarse_level = int(coarse_level)
         self.jfa_mask_sigma = float(jfa_mask_sigma)
 
-        self.ctx = moderngl.create_standalone_context(require=410)
+        self.ctx = ctx or moderngl.create_standalone_context(require=410)
         self.ctx.point_size = 1.0
 
         shaders_dir = Path(shaders_dir)
@@ -58,6 +59,9 @@ class HoleFillingRenderer:
         )
         self.multiply_program = self._load_program_from_source(
             quad_vertex, shaders_dir / "multiply_visibility.frag"
+        )
+        self.copy_program = self._load_program_from_source(
+            quad_vertex, shaders_dir / "copy.frag"
         )
         self.push_program = self._load_program_from_source(
             quad_vertex, shaders_dir / "push_color.frag"
@@ -120,6 +124,49 @@ class HoleFillingRenderer:
         if points.size == 0:
             return np.zeros((self.height, self.width, 3), dtype=np.uint8)
 
+        vao, buffers = self._build_points_vao(points, colors, confidences)
+        try:
+            self._render_pipeline(vao, view_mat, proj_mat, fov_y)
+            return self._read_final_color()
+        finally:
+            self._release_points_vao(vao, buffers)
+
+    def render_to_screen(
+        self,
+        points: np.ndarray,
+        colors: np.ndarray,
+        confidences: np.ndarray,
+        view_mat: np.ndarray,
+        proj_mat: np.ndarray,
+        fov_y: float,
+    ) -> None:
+        if points.size == 0:
+            self.ctx.screen.use()
+            self.ctx.clear(0.0, 0.0, 0.0, 1.0)
+            return
+
+        vao, buffers = self._build_points_vao(points, colors, confidences)
+        try:
+            self._render_pipeline(vao, view_mat, proj_mat, fov_y)
+            self.ctx.screen.use()
+            screen_width, screen_height = self.ctx.screen.size
+            self.ctx.viewport = (0, 0, screen_width, screen_height)
+            self.ctx.disable(moderngl.DEPTH_TEST)
+            self.final_mask_pass.color_textures[0].use(0)
+            self.copy_program["u_tex_source"].value = 0
+            quad = self._quad_vao(self.copy_program)
+            quad.render(mode=moderngl.TRIANGLE_STRIP)
+        finally:
+            self._release_points_vao(vao, buffers)
+
+    def _build_points_vao(
+        self,
+        points: np.ndarray,
+        colors: np.ndarray,
+        confidences: np.ndarray,
+    ) -> tuple[
+        moderngl.VertexArray, tuple[moderngl.Buffer, moderngl.Buffer, moderngl.Buffer]
+    ]:
         points = np.asarray(points, dtype=np.float32)
         colors = np.asarray(colors, dtype=np.float32)
         confidences = np.asarray(confidences, dtype=np.float32).reshape(-1, 1)
@@ -136,21 +183,31 @@ class HoleFillingRenderer:
                 (conf_buffer, "1f", "a_confidence"),
             ],
         )
+        return vao, (pos_buffer, color_buffer, conf_buffer)
 
-        try:
-            self._render_points_pass(vao, view_mat, proj_mat)
-            self._render_downsample_passes()
-            self._render_hpr_pass(fov_y)
-            self._render_multiply_passes()
-            self._render_jfa_passes()
-            self._render_push_pull_passes()
-            self._render_final_mask()
-            return self._read_final_color()
-        finally:
-            vao.release()
-            pos_buffer.release()
-            color_buffer.release()
-            conf_buffer.release()
+    def _release_points_vao(
+        self,
+        vao: moderngl.VertexArray,
+        buffers: tuple[moderngl.Buffer, moderngl.Buffer, moderngl.Buffer],
+    ) -> None:
+        vao.release()
+        for buffer in buffers:
+            buffer.release()
+
+    def _render_pipeline(
+        self,
+        vao: moderngl.VertexArray,
+        view_mat: np.ndarray,
+        proj_mat: np.ndarray,
+        fov_y: float,
+    ) -> None:
+        self._render_points_pass(vao, view_mat, proj_mat)
+        self._render_downsample_passes()
+        self._render_hpr_pass(fov_y)
+        self._render_multiply_passes()
+        self._render_jfa_passes()
+        self._render_push_pull_passes()
+        self._render_final_mask()
 
     def _load_program(self, vert_path: Path, frag_path: Path) -> moderngl.Program:
         return self.ctx.program(
@@ -348,13 +405,15 @@ class HoleFillingRenderer:
         cam_levels = [self.points_pass.color_textures[1]] + [
             pass_.color_textures[1] for pass_ in self.downsample_passes
         ]
+        num_levels = min(self.max_level, len(cam_levels))
+        coarse_level = min(self.coarse_level, num_levels - 1)
         for idx in range(self.max_level):
-            tex = cam_levels[min(idx, len(cam_levels) - 1)]
+            tex = cam_levels[min(idx, num_levels - 1)]
             tex.use(idx)
 
         self.hpr_program["u_tex_cam_pos_levels"].value = tuple(range(self.max_level))
-        self.hpr_program["u_num_levels"].value = self.max_level
-        self.hpr_program["u_coarse_level"].value = self.coarse_level
+        self.hpr_program["u_num_levels"].value = num_levels
+        self.hpr_program["u_coarse_level"].value = coarse_level
         self.hpr_program["u_viewport_size"].value = (
             float(self.width),
             float(self.height),
@@ -542,3 +601,6 @@ class HoleFillingRenderer:
         rgba = np.clip(rgba, 0.0, 1.0)
         rgb = rgba[..., :3] * rgba[..., 3:4]
         return np.clip(rgb * 255.0, 0.0, 255.0).astype(np.uint8)
+
+    def read_final_color(self) -> np.ndarray:
+        return self._read_final_color()

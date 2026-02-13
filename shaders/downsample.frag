@@ -10,6 +10,8 @@ layout(location = 0) out vec4 o_color;
 layout(location = 1) out vec4 o_cam_pos;
 
 void main(void) {
+	o_color = vec4(0.0);
+	o_cam_pos = vec4(0.0);
 	float best_depth = 1.0;
 
 	for (int j = 0; j < 2; ++j) {

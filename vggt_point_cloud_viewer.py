@@ -2,10 +2,13 @@ import argparse
 import math
 from pathlib import Path
 
+import moderngl
 import numpy as np
 import torch
+import torch.nn.functional as torch_nn
 from PIL import Image
 
+from hole_filling_renderer import HoleFillingRenderer
 from vggt.models.vggt import VGGT
 from vggt.utils.geometry import unproject_depth_map_to_point_map
 from vggt.utils.load_fn import load_and_preprocess_images
@@ -14,9 +17,20 @@ from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run VGGT on an image and view the point cloud in OpenGL."
+        description="Run VGGT on one or more images and view the point cloud in OpenGL."
     )
-    parser.add_argument("image", type=Path, help="Path to the input image.")
+    parser.add_argument(
+        "images",
+        type=Path,
+        nargs="+",
+        help="One or more input image paths.",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="Path to write exported render image.",
+    )
     parser.add_argument(
         "--preprocess-mode",
         type=str,
@@ -33,15 +47,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--conf-threshold",
+        "--depth-conf-threshold",
+        dest="conf_threshold",
         type=float,
         default=1.01,
         help="Filter depth points with confidence below this value (default: 1.01).",
-    )
-    parser.add_argument(
-        "--max-points",
-        type=int,
-        default=200000,
-        help="Maximum number of points to display (default: 200000).",
     )
     parser.add_argument(
         "--stride",
@@ -55,26 +65,72 @@ def parse_args() -> argparse.Namespace:
         default=1.5,
         help="OpenGL point size (default: 1.5).",
     )
+    parser.add_argument(
+        "--resize-width",
+        type=int,
+        default=0,
+        help="Resize depth/confidence/color maps to this width (default: 0).",
+    )
+    parser.add_argument(
+        "--resize-height",
+        type=int,
+        default=0,
+        help="Resize depth/confidence/color maps to this height (default: 0).",
+    )
+    parser.add_argument(
+        "--viewport-width",
+        type=int,
+        default=0,
+        help="Initial viewer window width (default: map width).",
+    )
+    parser.add_argument(
+        "--viewport-height",
+        type=int,
+        default=0,
+        help="Initial viewer window height (default: map height).",
+    )
+    parser.add_argument(
+        "--sigma",
+        type=float,
+        default=20.0,
+        help="Sigma for fake Gaussian splatting (default: 20.0).",
+    )
+    parser.add_argument(
+        "--auto-s0",
+        action="store_true",
+        help="Estimate s0 from depth and intrinsics (default: off).",
+    )
+    parser.add_argument(
+        "--s0",
+        type=float,
+        default=0.0,
+        help="Override s0 manually when --auto-s0 is off (default: 0.0).",
+    )
+    parser.add_argument(
+        "--occlusion-threshold",
+        type=float,
+        default=0.1,
+        help="HPR occlusion threshold (default: 0.1).",
+    )
+    parser.add_argument(
+        "--coarse-level",
+        type=int,
+        default=4,
+        help="HPR coarse mip level (default: 4).",
+    )
     return parser.parse_args()
 
 
 def load_model(device: torch.device) -> VGGT:
-    model = VGGT.from_pretrained("facebook/VGGT-1B").to(device)
+    model = VGGT.from_pretrained("facebook/VGGT-1B-Commercial").to(device)
     model.eval()
     return model
 
 
-def load_image_for_colors(image_path: Path) -> np.ndarray:
-    with Image.open(image_path) as img:
-        if img.mode == "RGBA":
-            background = Image.new("RGBA", img.size, (255, 255, 255, 255))
-            img = Image.alpha_composite(background, img)
-        img = img.convert("RGB")
-        return np.asarray(img, dtype=np.float32) / 255.0
-
-
-def run_vggt(image_path: Path, device: torch.device, preprocess_mode: str):
-    images = load_and_preprocess_images([str(image_path)], mode=preprocess_mode)
+def run_vggt(image_paths: list[Path], device: torch.device, preprocess_mode: str):
+    images = load_and_preprocess_images(
+        [str(path) for path in image_paths], mode=preprocess_mode
+    )
     images = images.to(device)
     model_height, model_width = images.shape[-2:]
     dtype = (
@@ -98,13 +154,165 @@ def run_vggt(image_path: Path, device: torch.device, preprocess_mode: str):
     if depth is None or depth_conf is None:
         raise ValueError("Depth predictions are missing from VGGT output.")
 
-    depth = depth.squeeze(0).cpu().numpy()
-    depth_conf = depth_conf.squeeze(0).cpu().numpy()
-    extrinsic = extrinsic.squeeze(0).cpu().numpy()
-    intrinsic = intrinsic.squeeze(0).cpu().numpy()
-    colors = images.squeeze(0).permute(1, 2, 0).cpu().numpy()
+    if images.ndim == 5 and images.shape[0] == 1:
+        images = images[0]
+    if images.ndim != 4:
+        raise ValueError(f"Unsupported image tensor shape: {tuple(images.shape)}")
+
+    depth = depth.cpu().numpy()
+    depth_conf = depth_conf.cpu().numpy()
+    extrinsic = extrinsic.cpu().numpy()
+    intrinsic = intrinsic.cpu().numpy()
+
+    if depth.ndim == 5 and depth.shape[0] == 1:
+        depth = depth[0]
+    if depth_conf.ndim == 5 and depth_conf.shape[0] == 1:
+        depth_conf = depth_conf[0]
+    if (
+        depth_conf.ndim == 4
+        and depth_conf.shape[0] == 1
+        and depth_conf.shape[1] == depth.shape[0]
+    ):
+        depth_conf = depth_conf[0]
+    if extrinsic.ndim == 4 and extrinsic.shape[0] == 1:
+        extrinsic = extrinsic[0]
+    if intrinsic.ndim == 4 and intrinsic.shape[0] == 1:
+        intrinsic = intrinsic[0]
+
+    colors = images.permute(0, 2, 3, 1).cpu().numpy()
 
     return depth, depth_conf, extrinsic, intrinsic, colors, (model_width, model_height)
+
+
+def build_point_cloud_batch(
+    depth: np.ndarray,
+    depth_conf: np.ndarray,
+    extrinsic: np.ndarray,
+    intrinsic: np.ndarray,
+    colors: np.ndarray,
+    conf_threshold: float,
+    stride: int,
+):
+    if depth.ndim == 5 and depth.shape[0] == 1:
+        depth = depth[0]
+    if depth_conf.ndim == 5 and depth_conf.shape[0] == 1:
+        depth_conf = depth_conf[0]
+    if (
+        depth_conf.ndim == 4
+        and depth_conf.shape[0] == 1
+        and depth_conf.shape[1] == depth.shape[0]
+    ):
+        depth_conf = depth_conf[0]
+    if extrinsic.ndim == 4 and extrinsic.shape[0] == 1:
+        extrinsic = extrinsic[0]
+    if intrinsic.ndim == 4 and intrinsic.shape[0] == 1:
+        intrinsic = intrinsic[0]
+    if colors.ndim == 5 and colors.shape[0] == 1:
+        colors = colors[0]
+
+    count = int(depth.shape[0])
+    points_list: list[np.ndarray] = []
+    colors_list: list[np.ndarray] = []
+    conf_list: list[np.ndarray] = []
+
+    for idx in range(count):
+        pts, cols, confs = build_point_cloud(
+            depth[idx],
+            depth_conf[idx],
+            extrinsic[idx],
+            intrinsic[idx],
+            colors[idx],
+            conf_threshold=conf_threshold,
+            stride=stride,
+        )
+        if pts.size == 0:
+            continue
+        points_list.append(pts)
+        colors_list.append(cols)
+        conf_list.append(confs)
+
+    if not points_list:
+        return (
+            np.zeros((0, 3), dtype=np.float32),
+            np.zeros((0, 3), dtype=np.float32),
+            np.zeros((0,), dtype=np.float32),
+        )
+
+    points = np.concatenate(points_list, axis=0)
+    point_colors = np.concatenate(colors_list, axis=0)
+    conf_values = np.concatenate(conf_list, axis=0)
+
+    return (
+        points.astype(np.float32),
+        point_colors.astype(np.float32),
+        conf_values.astype(np.float32),
+    )
+
+
+def estimate_s0_batch(depth: np.ndarray, intrinsic: np.ndarray) -> float:
+    values: list[float] = []
+    for idx in range(int(depth.shape[0])):
+        cur_s0 = estimate_s0_from_depth(depth[idx], intrinsic[idx])
+        if cur_s0 > 0.0:
+            values.append(cur_s0)
+    if not values:
+        return 0.0
+    return float(np.median(np.array(values, dtype=np.float32)))
+
+
+def resize_depth_conf_colors(
+    depth: np.ndarray,
+    depth_conf: np.ndarray,
+    colors: np.ndarray,
+    target_size: tuple[int, int],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    target_width, target_height = target_size
+
+    depth_tensor = torch.from_numpy(np.asarray(depth, dtype=np.float32)).permute(
+        0, 3, 1, 2
+    )
+    depth_tensor = torch_nn.interpolate(
+        depth_tensor,
+        size=(target_height, target_width),
+        mode="bilinear",
+        align_corners=False,
+    )
+    depth_out = depth_tensor.permute(0, 2, 3, 1).cpu().numpy()
+
+    conf_tensor = torch.from_numpy(np.asarray(depth_conf, dtype=np.float32))[
+        :, None, :, :
+    ]
+    conf_tensor = torch_nn.interpolate(
+        conf_tensor,
+        size=(target_height, target_width),
+        mode="bilinear",
+        align_corners=False,
+    )
+    conf_out = conf_tensor[:, 0, :, :].cpu().numpy()
+
+    color_tensor = torch.from_numpy(np.asarray(colors, dtype=np.float32)).permute(
+        0, 3, 1, 2
+    )
+    color_tensor = torch_nn.interpolate(
+        color_tensor,
+        size=(target_height, target_width),
+        mode="bilinear",
+        align_corners=False,
+    )
+    color_out = color_tensor.permute(0, 2, 3, 1).cpu().numpy()
+
+    return depth_out, conf_out, color_out
+
+
+def scale_intrinsic_batch(
+    intrinsic: np.ndarray,
+    src_size: tuple[int, int],
+    dst_size: tuple[int, int],
+) -> np.ndarray:
+    scaled = np.asarray(intrinsic, dtype=np.float32).copy()
+    for idx in range(scaled.shape[0]):
+        scaled[idx] = scale_intrinsic(scaled[idx], src_size, dst_size)
+    return scaled
 
 
 def build_point_cloud(
@@ -115,7 +323,6 @@ def build_point_cloud(
     colors: np.ndarray,
     conf_threshold: float,
     stride: int,
-    max_points: int,
 ):
     if depth.ndim == 4 and depth.shape[0] == 1 and depth.shape[-1] == 1:
         depth_2d = depth[0, :, :, 0]
@@ -151,19 +358,10 @@ def build_point_cloud(
         depth_map[None, ...], extrinsic[None, ...], intrinsic[None, ...]
     )[0]
 
-    conversion = np.array([1.0, -1.0, -1.0], dtype=np.float32)
-    world_points = world_points * conversion
-
     valid_mask = (depth_map.squeeze(-1) > 1e-6) & (depth_conf >= conf_threshold)
     points = world_points[valid_mask]
     point_colors = colors[valid_mask]
     conf_values = depth_conf[valid_mask]
-
-    if max_points > 0 and points.shape[0] > max_points:
-        indices = np.random.choice(points.shape[0], size=max_points, replace=False)
-        points = points[indices]
-        point_colors = point_colors[indices]
-        conf_values = conf_values[indices]
 
     return points.astype(np.float32), point_colors.astype(np.float32), conf_values
 
@@ -177,6 +375,30 @@ def compute_depth_colors(points: np.ndarray) -> np.ndarray:
     span = max(depth_max - depth_min, 1e-6)
     t = np.clip((depth - depth_min) / span, 0.0, 1.0)
     return np.stack([t, 1.0 - t, np.full_like(t, 0.1)], axis=-1).astype(np.float32)
+
+
+def estimate_s0_from_depth(
+    depth_map: np.ndarray, intrinsic: np.ndarray, eps: float = 1e-6
+) -> float:
+    if depth_map.ndim == 4 and depth_map.shape[0] == 1 and depth_map.shape[-1] == 1:
+        depth_map = depth_map[0, :, :, 0]
+    elif depth_map.ndim == 3 and depth_map.shape[-1] == 1:
+        depth_map = depth_map[:, :, 0]
+    elif depth_map.ndim == 3 and depth_map.shape[0] == 1:
+        depth_map = depth_map[0]
+    if depth_map.ndim == 3:
+        depth_map = depth_map.squeeze(-1)
+    if intrinsic.ndim > 2:
+        intrinsic = intrinsic.squeeze()
+    valid = depth_map > eps
+    if not np.any(valid):
+        return 0.0
+    fx = float(intrinsic[0, 0])
+    fy = float(intrinsic[1, 1])
+    dx = depth_map / max(fx, eps)
+    dy = depth_map / max(fy, eps)
+    spacing = np.sqrt(dx * dx + dy * dy)
+    return float(np.median(spacing[valid]))
 
 
 def scale_intrinsic(
@@ -219,19 +441,50 @@ def projection_from_intrinsic(
     return proj
 
 
+def build_view_matrix(extrinsic: np.ndarray) -> np.ndarray:
+    view = np.eye(4, dtype=np.float32)
+    view[:3, :3] = extrinsic[:3, :3]
+    view[:3, 3] = extrinsic[:3, 3]
+    conversion = np.diag([1.0, -1.0, -1.0, 1.0]).astype(np.float32)
+    return conversion @ view
+
+
 def main() -> None:
     args = parse_args()
-    if not args.image.exists():
-        raise FileNotFoundError(f"Image not found: {args.image}")
+    if (args.resize_width == 0) != (args.resize_height == 0):
+        raise ValueError("Both resize width and height must be set or both 0.")
+    if (args.viewport_width == 0) != (args.viewport_height == 0):
+        raise ValueError("Both viewport width and height must be set or both 0.")
+
+    resize_size = None
+    if args.resize_width > 0 and args.resize_height > 0:
+        resize_size = (args.resize_width, args.resize_height)
+
+    missing = [path for path in args.images if not path.exists()]
+    if missing:
+        missing_text = ", ".join(str(path) for path in missing)
+        raise FileNotFoundError(f"Image(s) not found: {missing_text}")
 
     device_name = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     device = torch.device(device_name)
 
     depth, depth_conf, extrinsic, intrinsic, colors, model_size = run_vggt(
-        args.image, device, args.preprocess_mode
+        args.images, device, args.preprocess_mode
+    )
+    point_map_size = model_size
+    if resize_size is not None:
+        depth, depth_conf, colors = resize_depth_conf_colors(
+            depth, depth_conf, colors, resize_size
+        )
+        intrinsic = scale_intrinsic_batch(intrinsic, model_size, resize_size)
+        point_map_size = resize_size
+
+    print(
+        f"Point-map resolution: {point_map_size[0]}x{point_map_size[1]} "
+        f"(model output {model_size[0]}x{model_size[1]})"
     )
 
-    points, point_colors, conf_values = build_point_cloud(
+    points, point_colors, conf_values = build_point_cloud_batch(
         depth,
         depth_conf,
         extrinsic,
@@ -239,12 +492,12 @@ def main() -> None:
         colors,
         conf_threshold=args.conf_threshold,
         stride=max(args.stride, 1),
-        max_points=max(args.max_points, 0),
     )
+    conf_threshold = args.conf_threshold
 
     if points.size == 0 and args.conf_threshold > 0.0:
         print("No points after confidence filter; retrying with --conf-threshold 0.0")
-        points, point_colors, conf_values = build_point_cloud(
+        points, point_colors, conf_values = build_point_cloud_batch(
             depth,
             depth_conf,
             extrinsic,
@@ -252,53 +505,32 @@ def main() -> None:
             colors,
             conf_threshold=0.0,
             stride=max(args.stride, 1),
-            max_points=max(args.max_points, 0),
         )
+        conf_threshold = 0.0
+
+    if conf_values.size > 0 and conf_threshold > conf_values.max():
+        conf_threshold = 0.0
 
     if points.size == 0:
         raise ValueError(
             "No points to display. Try lowering --stride or check depth output."
         )
 
+    print(f"Rendering {points.shape[0]} points")
+
     depth_colors = compute_depth_colors(points)
+    if args.auto_s0:
+        s0 = estimate_s0_batch(depth, intrinsic)
+    else:
+        s0 = max(float(args.s0), 0.0)
 
     try:
         import pyglet
         from pyglet import gl
-        from pyglet.graphics import shader
     except ImportError as exc:
         raise ImportError(
             "pyglet is required for viewing. Install with: pip install pyglet"
         ) from exc
-
-    def translate_matrix(x: float, y: float, z: float) -> np.ndarray:
-        mat = np.eye(4, dtype=np.float32)
-        mat[0, 3] = x
-        mat[1, 3] = y
-        mat[2, 3] = z
-        return mat
-
-    def rotate_x_matrix(deg: float) -> np.ndarray:
-        rad = math.radians(deg)
-        c = math.cos(rad)
-        s = math.sin(rad)
-        mat = np.eye(4, dtype=np.float32)
-        mat[1, 1] = c
-        mat[1, 2] = -s
-        mat[2, 1] = s
-        mat[2, 2] = c
-        return mat
-
-    def rotate_y_matrix(deg: float) -> np.ndarray:
-        rad = math.radians(deg)
-        c = math.cos(rad)
-        s = math.sin(rad)
-        mat = np.eye(4, dtype=np.float32)
-        mat[0, 0] = c
-        mat[0, 2] = s
-        mat[2, 0] = -s
-        mat[2, 2] = c
-        return mat
 
     def look_at(eye: np.ndarray, target: np.ndarray, up: np.ndarray) -> np.ndarray:
         forward = target - eye
@@ -322,27 +554,48 @@ def main() -> None:
             vertices,
             rgb_colors,
             depth_colors,
+            confidences,
             point_size,
             intrinsic,
             model_size,
+            window_size,
             extrinsic,
+            shaders_dir,
+            output_path,
+            confidence_threshold,
+            s0,
+            sigma,
+            occlusion_threshold,
+            coarse_level,
         ):
+            if window_size is None:
+                width, height = int(model_size[0]), int(model_size[1])
+            else:
+                width, height = int(window_size[0]), int(window_size[1])
             super().__init__(
-                width=1200,
-                height=800,
+                width=width,
+                height=height,
                 caption="VGGT Point Cloud Viewer",
-                resizable=True,
+                resizable=False,
             )
             self.vertices = vertices
             self.rgb_colors = rgb_colors
             self.depth_colors = depth_colors
+            self.confidences = confidences
             self.use_depth_colors = False
             self.point_size = point_size
-            self.vertex_list = None
-            self.program = None
             self.intrinsic = intrinsic
             self.model_size = model_size
+            self.fixed_render_size = window_size
             self.extrinsic = extrinsic
+            self.shaders_dir = Path(shaders_dir)
+            self.output_path = Path(output_path)
+            self.confidence_threshold = float(confidence_threshold)
+            self.s0_base = float(s0)
+            self.jfa_mask_sigma = float(sigma)
+            self.occlusion_threshold = float(occlusion_threshold)
+            self.coarse_level = max(int(coarse_level), 0)
+            self.world_up = np.array([0.0, -1.0, 0.0], dtype=np.float32)
 
             self.center = self.vertices.mean(axis=0)
             radius = np.linalg.norm(self.vertices - self.center, axis=1).max()
@@ -366,10 +619,23 @@ def main() -> None:
                 "boost": False,
             }
 
+            self.renderer: HoleFillingRenderer | None = None
+            self.render_size: tuple[int, int] | None = None
+            self.ctx: moderngl.Context | None = None
+
             self._reset_camera()
             self._init_gl()
-            self._update_vertex_list()
             pyglet.clock.schedule_interval(self._update_camera, 1.0 / 60.0)
+
+        def _save_current_frame(self):
+            self._ensure_renderer()
+            self._render_frame()
+            if self.renderer is None:
+                raise RuntimeError("Renderer not initialized")
+            frame = self.renderer.read_final_color()
+            self.output_path.parent.mkdir(parents=True, exist_ok=True)
+            Image.fromarray(frame).save(self.output_path)
+            print(f"Saved render to {self.output_path}")
 
         def _reset_camera(self):
             if self.use_vggt_pose and self.extrinsic is not None:
@@ -378,7 +644,7 @@ def main() -> None:
                 self.yaw = 0.0
                 self.pitch = 0.0
                 self.camera_pos = self.center + np.array(
-                    [0.0, 0.0, self.distance], dtype=np.float32
+                    [0.0, 0.0, -self.distance], dtype=np.float32
                 )
 
         def _init_camera_from_extrinsic(self, extrinsic):
@@ -399,107 +665,102 @@ def main() -> None:
             cam_to_world_r = r.T
             cam_to_world_t = -r.T @ t
 
-            conversion = np.diag([1.0, -1.0, -1.0]).astype(np.float32)
-            cam_to_world_r = conversion @ cam_to_world_r @ conversion
-            cam_to_world_t = conversion @ cam_to_world_t
-
-            forward = cam_to_world_r @ np.array([0.0, 0.0, -1.0], dtype=np.float32)
-            yaw = math.degrees(math.atan2(forward[0], -forward[2]))
-            pitch = math.degrees(math.asin(np.clip(forward[1], -1.0, 1.0)))
+            forward = cam_to_world_r @ np.array([0.0, 0.0, 1.0], dtype=np.float32)
+            yaw = math.degrees(math.atan2(forward[0], forward[2]))
+            pitch = -math.degrees(math.asin(np.clip(forward[1], -1.0, 1.0)))
             self.yaw = yaw
             self.pitch = pitch
             self.camera_pos = cam_to_world_t.astype(np.float32)
 
         def _init_gl(self):
-            gl.glEnable(gl.GL_DEPTH_TEST)
-            gl.glEnable(gl.GL_PROGRAM_POINT_SIZE)
             gl.glClearColor(0.05, 0.06, 0.07, 1.0)
 
-            vertex_source = """
-            #version 330
-            in vec3 position;
-            in vec3 color;
-            uniform mat4 mvp;
-            uniform float point_size;
-            out vec3 v_color;
-            void main() {
-                gl_Position = mvp * vec4(position, 1.0);
-                gl_PointSize = point_size;
-                v_color = color;
-            }
-            """
-            fragment_source = """
-            #version 330
-            in vec3 v_color;
-            out vec4 out_color;
-            void main() {
-                out_color = vec4(v_color, 1.0);
-            }
-            """
-            self.program = shader.ShaderProgram(
-                shader.Shader(vertex_source, "vertex"),
-                shader.Shader(fragment_source, "fragment"),
-            )
-
-        def _update_vertex_list(self):
-            colors = self.depth_colors if self.use_depth_colors else self.rgb_colors
-            if self.vertex_list is None:
-                self.vertex_list = self.program.vertex_list(
-                    len(self.vertices),
-                    gl.GL_POINTS,
-                    position=("f", self.vertices.flatten()),
-                    color=("f", colors.flatten()),
-                )
+        def _ensure_renderer(self):
+            self.switch_to()
+            if self.ctx is None:
+                self.ctx = moderngl.create_context()
+            if self.fixed_render_size is not None:
+                size = self.fixed_render_size
             else:
-                self.vertex_list.color = colors.flatten()
+                size = self.get_framebuffer_size()
+            if self.renderer is None or self.render_size != size:
+                self.renderer = HoleFillingRenderer(
+                    size[0],
+                    size[1],
+                    shaders_dir=self.shaders_dir,
+                    confidence_threshold=self.confidence_threshold,
+                    jfa_mask_sigma=self.jfa_mask_sigma,
+                    occlusion_threshold=self.occlusion_threshold,
+                    coarse_level=self.coarse_level,
+                    ctx=self.ctx,
+                )
+                if self.s0_base > 0.0:
+                    self.renderer.s0 = self.s0_base
+                self.render_size = size
+            if self.renderer is not None:
+                self.renderer.ctx.point_size = float(self.point_size)
 
-        def on_draw(self):
-            self.clear()
+        def _render_frame(self) -> None:
+            colors = self.depth_colors if self.use_depth_colors else self.rgb_colors
             near = 0.01
             far = 10000.0
+            if self.render_size is None:
+                render_width, render_height = self.get_framebuffer_size()
+            else:
+                render_width, render_height = self.render_size
 
             if self.intrinsic is None:
-                proj = projection_from_intrinsic(
-                    np.array(
-                        [
-                            [self.width, 0.0, self.width * 0.5],
-                            [0.0, self.height, self.height * 0.5],
-                            [0.0, 0.0, 1.0],
-                        ],
-                        dtype=np.float32,
-                    ),
-                    self.width,
-                    self.height,
-                    near,
-                    far,
+                base_intrinsic = np.array(
+                    [
+                        [render_width, 0.0, render_width * 0.5],
+                        [0.0, render_height, render_height * 0.5],
+                        [0.0, 0.0, 1.0],
+                    ],
+                    dtype=np.float32,
                 )
             else:
-                scaled_intrinsic = scale_intrinsic(
-                    self.intrinsic, self.model_size, (self.width, self.height)
+                base_intrinsic = scale_intrinsic(
+                    self.intrinsic.squeeze(),
+                    self.model_size,
+                    (render_width, render_height),
                 )
-                proj = projection_from_intrinsic(
-                    scaled_intrinsic, self.width, self.height, near, far
-                )
+
+            proj = projection_from_intrinsic(
+                base_intrinsic, render_width, render_height, near, far
+            )
+            fov_y = 2.0 * math.atan(0.5 * render_height / base_intrinsic[1, 1])
 
             yaw_rad = math.radians(self.yaw)
             pitch_rad = math.radians(self.pitch)
             forward = np.array(
                 [
                     math.cos(pitch_rad) * math.sin(yaw_rad),
-                    math.sin(pitch_rad),
-                    -math.cos(pitch_rad) * math.cos(yaw_rad),
+                    -math.sin(pitch_rad),
+                    math.cos(pitch_rad) * math.cos(yaw_rad),
                 ],
                 dtype=np.float32,
             )
-            target = self.camera_pos + forward
-            up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
-            view = look_at(self.camera_pos, target, up)
-            mvp = proj @ view
+            view = look_at(
+                self.camera_pos,
+                self.camera_pos + forward,
+                self.world_up,
+            )
 
-            self.program.use()
-            self.program["mvp"] = mvp.T.astype(np.float32).flatten().tolist()
-            self.program["point_size"] = float(self.point_size)
-            self.vertex_list.draw(gl.GL_POINTS)
+            if self.renderer is None:
+                raise RuntimeError("Renderer not initialized")
+            self.renderer.render_to_screen(
+                self.vertices,
+                colors,
+                self.confidences,
+                view,
+                proj,
+                fov_y,
+            )
+
+        def on_draw(self):
+            self.clear()
+            self._ensure_renderer()
+            self._render_frame()
 
         def on_mouse_drag(self, x, y, dx, dy, buttons, modifiers):
             if self.mouse_look:
@@ -519,24 +780,14 @@ def main() -> None:
             self.move_speed *= math.pow(1.1, scroll_y)
 
         def on_key_press(self, symbol, modifiers):
-            if symbol == pyglet.window.key.R:
-                self._reset_camera()
-            elif symbol == pyglet.window.key.C:
-                self.use_depth_colors = not self.use_depth_colors
-                self._update_vertex_list()
-            elif symbol == pyglet.window.key.T:
-                self.use_vggt_pose = not self.use_vggt_pose
-                self._reset_camera()
-            elif symbol == pyglet.window.key.F:
+            if symbol == pyglet.window.key.F:
                 self.yaw = 0.0
                 self.pitch = 0.0
                 self.camera_pos = self.center + np.array(
-                    [0.0, 0.0, self.distance], dtype=np.float32
+                    [0.0, 0.0, -self.distance], dtype=np.float32
                 )
-            elif symbol == pyglet.window.key.EQUAL or symbol == pyglet.window.key.PLUS:
-                self.point_size = min(self.point_size + 0.5, 10.0)
-            elif symbol == pyglet.window.key.MINUS:
-                self.point_size = max(self.point_size - 0.5, 0.5)
+            elif symbol == pyglet.window.key.E:
+                self._save_current_frame()
             elif symbol == pyglet.window.key.W:
                 self.move_state["forward"] = True
             elif symbol == pyglet.window.key.S:
@@ -547,7 +798,7 @@ def main() -> None:
                 self.move_state["right"] = True
             elif symbol == pyglet.window.key.Q:
                 self.move_state["down"] = True
-            elif symbol == pyglet.window.key.E:
+            elif symbol == pyglet.window.key.SPACE:
                 self.move_state["up"] = True
             elif symbol == pyglet.window.key.LSHIFT:
                 self.move_state["boost"] = True
@@ -563,10 +814,14 @@ def main() -> None:
                 self.move_state["right"] = False
             elif symbol == pyglet.window.key.Q:
                 self.move_state["down"] = False
-            elif symbol == pyglet.window.key.E:
+            elif symbol == pyglet.window.key.SPACE:
                 self.move_state["up"] = False
             elif symbol == pyglet.window.key.LSHIFT:
                 self.move_state["boost"] = False
+
+        def on_close(self):
+            self._save_current_frame()
+            return super().on_close()
 
         def _update_camera(self, dt):
             yaw_rad = math.radians(self.yaw)
@@ -574,13 +829,12 @@ def main() -> None:
             forward = np.array(
                 [
                     math.cos(pitch_rad) * math.sin(yaw_rad),
-                    math.sin(pitch_rad),
-                    -math.cos(pitch_rad) * math.cos(yaw_rad),
+                    -math.sin(pitch_rad),
+                    math.cos(pitch_rad) * math.cos(yaw_rad),
                 ],
                 dtype=np.float32,
             )
-            up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
-            right = np.cross(forward, up)
+            right = np.cross(forward, self.world_up)
             norm_right = np.linalg.norm(right)
             if norm_right > 1e-6:
                 right = right / norm_right
@@ -596,9 +850,9 @@ def main() -> None:
             if self.move_state["right"]:
                 velocity += right
             if self.move_state["up"]:
-                velocity += up
+                velocity += self.world_up
             if self.move_state["down"]:
-                velocity -= up
+                velocity -= self.world_up
 
             norm = np.linalg.norm(velocity)
             if norm > 1e-6:
@@ -606,16 +860,30 @@ def main() -> None:
                 self.camera_pos += velocity * speed * dt
 
     print("Controls: left-drag look, scroll adjust speed")
-    print("Keys: WASD move, Q/E down/up, Shift boost, C toggle depth colors, R reset")
+    print("Keys: WASD move, Q/Space down/up, Shift boost, F front view, E export")
+
+    shaders_dir = Path(__file__).resolve().parent / "shaders"
+    window_size = None
+    if args.viewport_width > 0 and args.viewport_height > 0:
+        window_size = (args.viewport_width, args.viewport_height)
 
     viewer = PointCloudViewer(
         points,
         point_colors,
         depth_colors,
+        conf_values,
         args.point_size,
-        intrinsic,
-        model_size,
-        extrinsic,
+        intrinsic[0],
+        point_map_size,
+        window_size,
+        extrinsic[0],
+        shaders_dir,
+        args.output,
+        conf_threshold,
+        s0,
+        args.sigma,
+        args.occlusion_threshold,
+        args.coarse_level,
     )
     pyglet.app.run()
 
