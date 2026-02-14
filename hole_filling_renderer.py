@@ -130,7 +130,9 @@ void main() {
     f_color = vec4(c, 1.0);
 }
 """
-        self.blit_program = self.ctx.program(vertex_shader=quad_vertex, fragment_shader=blit_frag)
+        self.blit_program = self.ctx.program(
+            vertex_shader=quad_vertex, fragment_shader=blit_frag
+        )
 
         self._quad_pos_buffer = self.ctx.buffer(
             np.array(

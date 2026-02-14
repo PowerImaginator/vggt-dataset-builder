@@ -43,7 +43,17 @@ python script.py          # Wrong
 python3 script.py         # Wrong
 ```
 
-For more details, see [.copilot-instructions.md](.copilot-instructions.md).
+**Code Formatting:** All Python code must be formatted with Black before submission:
+
+```bash
+# Format entire repo
+uv run black .
+
+# Check formatting without changing files
+uv run black --check .
+```
+
+For full contributing guidelines, see [CONTRIBUTING.md](CONTRIBUTING.md) and [.copilot-instructions.md](.copilot-instructions.md).
 
 ## Setup
 

@@ -47,16 +47,17 @@ def extract_dataset(
     verbose: bool = True,
 ) -> None:
     """Extract dataset for AI Toolkit training.
-    
+
     Uses the generic extraction function from dataset_utils to prepare a dataset
     with three subdirectories (control1, control2, target) for AI Toolkit training.
-    
+
     Args:
         output_dir: Path to output folder from build_warp_dataset.py
         aitoolkit_dir: Path to output aitoolkit-dataset folder
         prompt: Optional prompt text to save for each triplet
         verbose: Print progress information
     """
+
     # Define a naming function that maps counter & extension to output paths
     # for AI Toolkit's three-subdirectory structure
     def naming_fn(counter: int, ext: str) -> dict[str, Path]:
@@ -66,7 +67,7 @@ def extract_dataset(
             "target": aitoolkit_dir / "target" / f"{counter}{ext}",
             "prompt": aitoolkit_dir / "target" / f"{counter}.txt",
         }
-    
+
     extract_dataset_generic(
         output_dir,
         aitoolkit_dir,

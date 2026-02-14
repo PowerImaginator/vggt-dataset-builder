@@ -40,16 +40,17 @@ def extract_dataset(
     verbose: bool = True,
 ) -> None:
     """Extract dataset from output folder for ModelScope LoRA training.
-    
+
     Uses the generic extraction function from dataset_utils to prepare a dataset
     in ModelScope's flat directory structure with custom naming conventions.
-    
+
     Args:
         output_dir: Path to output folder from build_warp_dataset.py
         modelscope_dir: Path to output modelscope-dataset folder
         prompt: Optional prompt text to save for each triplet
         verbose: Print progress information
     """
+
     # Define a naming function that maps counter & extension to output paths
     # for ModelScope's flat directory structure with custom naming
     def naming_fn(counter: int, ext: str) -> dict[str, Path]:
@@ -59,7 +60,7 @@ def extract_dataset(
             "target": modelscope_dir / f"{counter}_end{ext}",
             "prompt": modelscope_dir / f"{counter}.txt",
         }
-    
+
     extract_dataset_generic(
         output_dir,
         modelscope_dir,
@@ -96,25 +97,25 @@ def main():
         default=None,
         help="Prompt text to save for each training triplet (saved as <N>.txt)",
     )
-    
+
     args = parser.parse_args()
-    
+
     # Validate output directory
     if not args.output_dir.exists():
         print(f"Error: Output directory not found: {args.output_dir}")
         return 1
-    
+
     if not args.output_dir.is_dir():
         print(f"Error: Output path is not a directory: {args.output_dir}")
         return 1
-    
+
     extract_dataset(
         args.output_dir,
         args.modelscope_dir,
         prompt=args.prompt,
         verbose=not args.quiet,
     )
-    
+
     return 0
 
 

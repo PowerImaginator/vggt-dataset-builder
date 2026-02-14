@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Smoke test: render a synthetic point cloud with HoleFillingRenderer."""
+
 import numpy as np
 from pathlib import Path
 from PIL import Image
 
 from hole_filling_renderer import HoleFillingRenderer
+
 
 def test_viewer_smoke():
     """Test rendering a synthetic point cloud with HoleFillingRenderer."""
@@ -16,7 +18,9 @@ def test_viewer_smoke():
     ys = np.linspace(-1.0, 1.0, 128)
     xv, yv = np.meshgrid(xs, ys)
     zv = 2.0 + 0.5 * np.sin(3.0 * xv) * np.cos(3.0 * yv)
-    points = np.stack([xv.flatten(), yv.flatten(), zv.flatten()], axis=-1).astype(np.float32)
+    points = np.stack([xv.flatten(), yv.flatten(), zv.flatten()], axis=-1).astype(
+        np.float32
+    )
 
     colors = np.zeros_like(points, dtype=np.float32)
     colors[:, 0] = (xv.flatten() + 1.0) * 0.5

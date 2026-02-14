@@ -9,10 +9,12 @@ sys.path.insert(0, str(workspace_root))
 
 import pytest
 
+
 @pytest.fixture
 def workspace_root_path():
     """Provide the workspace root path to tests."""
     return Path(__file__).parent.parent
+
 
 @pytest.fixture
 def test_data_dir():
