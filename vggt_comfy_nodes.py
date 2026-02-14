@@ -1,3 +1,20 @@
+"""
+ComfyUI integration nodes for VGGT depth estimation and Gaussian point cloud generation.
+
+This module provides ComfyUI custom nodes that wrap VGGT model inference and point cloud
+generation. The VGGT_Model_Inference node is the primary entry point, which:
+1. Estimates depth maps and camera poses using the VGGT-1B model
+2. Unprojects depth maps into 3D point clouds
+3. Exports point clouds as 3DGS-compatible PLY files for Gaussian viewer
+
+The module uses a global caching pattern for the VGGT model (_vggt_model, _vggt_model_device)
+to avoid reloading the large model during repeated ComfyUI node executions. The model is
+lazily imported on first use to reduce startup time.
+
+VGGT and ComfyUI dependencies are handled gracefully to allow the module to be imported
+even when ComfyUI is not available (for direct script usage).
+"""
+
 import os
 import numpy as np
 import torch
@@ -14,13 +31,41 @@ setup_vggt_path()
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 from vggt.utils.geometry import unproject_depth_map_to_point_map
 
-# Lazy loading of VGGT model
+# Global caching for VGGT model: Keeps the loaded model in memory to avoid expensive
+# reloads during repeated ComfyUI node executions. The model is moved between devices
+# (CPU/CUDA) as needed, with proper CUDA cache cleanup to prevent memory leaks.
 _vggt_model = None
 _vggt_model_device = None
 
 
 def get_vggt_model(device_name):
-    """Get VGGT model with proper caching and device management."""
+    """Get VGGT model with lazy loading, device management, and in-memory caching.
+
+    This function provides a cached VGGT model that can be reused across multiple
+    inferences. The model is loaded on first call and kept in memory; subsequent calls
+    return the cached instance. If the device changes (e.g., "cpu" to "cuda"), the model
+    is moved to the new device with proper CUDA cache cleanup.
+
+    Caching pattern rationale:
+    - Loading VGGT-1B from Hugging Face (~500MB) is expensive (~30-60s)
+    - ComfyUI nodes may be executed repeatedly; model persistence avoids reloads
+    - Global state is intentional: models are typically held at process level
+
+    Args:
+        device_name: Target device string: "cuda" or "cpu".
+
+    Returns:
+        torch.nn.Module: The VGGT model in eval mode on the requested device.
+
+    Raises:
+        ImportError: If VGGT is not available or Hugging Face model cannot be loaded.
+        RuntimeError: If device creation or model movement fails.
+
+    Example:
+        >>> model = get_vggt_model("cuda")
+        >>> depth_output = model(image_tensor)  # inference
+        >>> model = get_vggt_model("cpu")  # model moves to CPU
+    """
     global _vggt_model, _vggt_model_device
     from vggt.models.vggt import VGGT
 
@@ -50,7 +95,40 @@ def get_vggt_model(device_name):
 
 
 def write_ply_basic(path, points, colors, confs, scale_multiplier=0.5):
-    """Write a 3DGS-compatible PLY file matching GaussianViewer's format exactly."""
+    """Export point cloud as 3DGS-compatible PLY file for Gaussian viewer integration.
+
+    Converts point cloud data (positions, colors, confidences) into a PLY file formatted
+    to match GaussianViewer's expectations. This includes:
+    - Converting RGB colors to spherical harmonics DC coefficients
+    - Computing per-point scales based on scene density (avoid overlapping Gaussians)
+    - Setting initial opacity logits from confidence values
+    - Storing 3DGS properties (sh_0_*) in a format GaussianViewer can interpret
+
+    The scale computation uses scene size and point density to estimate reasonable scales
+    (~avg_point_distance * scale_multiplier); this prevents Gaussians from being too large
+    (which causes rendering artifacts) or too small (which causes flickering).
+
+    Args:
+        path: Output file path for the PLY file.
+        points: Point cloud positions, shape (N, 3), typically float32.
+        colors: RGB colors (0-1), shape (N, 3), will be clamped and normalized.
+        confs: Confidence values (typically 0-1), shape (N,), converted to opacity logits.
+        scale_multiplier: Multiplier for computed point scales (default 0.5, typical range 0.1-2.0).
+
+    Returns:
+        None. Writes PLY file to disk.
+
+    Raises:
+        IOError: If file cannot be written to the specified path.
+        ValueError: If input arrays have incompatible shapes or invalid values.
+
+    Example:
+        >>> import numpy as np
+        >>> points = np.random.randn(1000, 3)
+        >>> colors = np.random.rand(1000, 3)
+        >>> confs = np.random.rand(1000)
+        >>> write_ply_basic("output.ply", points, colors, confs, scale_multiplier=1.0)
+    """
     import numpy as np
     from plyfile import PlyElement, PlyData
 
@@ -154,6 +232,32 @@ def write_ply_basic(path, points, colors, confs, scale_multiplier=0.5):
 
 
 class VGGT_Model_Inference:
+    """ComfyUI custom node for VGGT depth estimation and Gaussian point cloud generation.
+
+    This node provides a high-level interface to VGGT's depth and pose estimation capabilities
+    within ComfyUI. The inference pipeline:
+    1. Preprocesses input image(s) according to the specified mode (crop/pad/tile)
+    2. Runs VGGT model to estimate depth maps and camera poses
+    3. Filters points by confidence threshold and optional masking (sky, black/white bg)
+    4. Unprojects depth maps to 3D point clouds in world space
+    5. Exports point clouds as 3DGS-compatible PLY files
+
+    The node supports both single-image and batch processing. Results are cached via the
+    global VGGT model instance (see get_vggt_model) to speed up repeated inferences in
+    ComfyUI workflows.
+
+    Key design decisions:
+    - Device management: Model moves to specified device (CPU/CUDA) on each execution
+    - Confidence thresholding: Applied as percentile (not absolute value) for consistency
+    - Upsampling: Optional depth/confidence upsampling restores original resolution detail
+    - Point filtering: Semantic segmentation available for sky removal (if opencv+onnxruntime available)
+
+    ComfyUI node metadata:
+    - RETURN_TYPES: tuple of output types (see RETURN_TYPES)
+    - FUNCTION: The method name that performs inference (must define 'infer' method)
+    - CATEGORY: "VGGT" (ComfyUI node category)
+    """
+
     def __init__(self):
         pass
 
