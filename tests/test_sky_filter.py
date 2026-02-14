@@ -1,15 +1,20 @@
-"""
-Test script for sky filtering
-Usage: python test_sky_filter.py <image_path>
+"""Test script for sky filtering.
+
+Can be run as pytest test or standalone script:
+  pytest test_sky_filter.py
+  python test_sky_filter.py <image_path>
 """
 
 import sys
 import numpy as np
 import cv2
 from pathlib import Path
+import pytest
 
 
-def test_sky_filter(image_path):
+def test_sky_filter(test_image_path, cache_dir):
+    """Test sky segmentation filter with default test image from fixture."""
+    image_path = test_image_path
     print(f"Testing sky filter on: {image_path}")
 
     # Check if onnxruntime is available
@@ -19,8 +24,8 @@ def test_sky_filter(image_path):
         print("ERROR: onnxruntime not installed. Install with: pip install onnxruntime")
         return
 
-    # Load the model
-    skyseg_model_path = Path(__file__).parent / "skyseg.onnx"
+    # Load the model from cache directory
+    skyseg_model_path = cache_dir / "skyseg.onnx"
     if not skyseg_model_path.exists():
         print(f"Downloading sky segmentation model to {skyseg_model_path}...")
         import urllib.request
@@ -123,10 +128,26 @@ def test_sky_filter(image_path):
     print("(Left: Original | Middle: Sky Mask | Right: Overlay with red=sky)")
 
 
-if __name__ == "__main__":
+def run_standalone():
+    """Run sky filter test as standalone script with custom image path."""
     if len(sys.argv) < 2:
         print("Usage: python test_sky_filter.py <image_path>")
         print("Example: python test_sky_filter.py test_image.jpg")
+        print("\nOr run as pytest: pytest test_sky_filter.py")
         sys.exit(1)
 
-    test_sky_filter(sys.argv[1])
+    # Mock the fixtures for standalone mode
+    test_image_path = Path(sys.argv[1])
+    if not test_image_path.exists():
+        print(f"ERROR: Image not found: {test_image_path}")
+        sys.exit(1)
+
+    # Use workspace .cache directory
+    cache_path = Path(__file__).parent.parent / ".cache"
+    cache_path.mkdir(parents=True, exist_ok=True)
+
+    test_sky_filter(test_image_path, cache_path)
+
+
+if __name__ == "__main__":
+    run_standalone()
