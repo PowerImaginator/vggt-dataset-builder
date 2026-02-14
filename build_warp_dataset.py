@@ -23,6 +23,7 @@ from vggt.utils.geometry import (
 from vggt.utils.load_fn import load_and_preprocess_images
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 from hole_filling_renderer import HoleFillingRenderer
+from dataset_utils import load_model, build_view_matrix
 
 try:
     import cv2
@@ -596,12 +597,6 @@ def list_scene_dirs(input_dir: Path) -> list[Path]:
     return scene_dirs
 
 
-def load_model(device: torch.device) -> VGGT:
-    model = VGGT.from_pretrained("facebook/VGGT-1B").to(device)
-    model.eval()
-    return model
-
-
 def build_preprocess_metadata(
     image_paths: list[Path],
     mode: str,
@@ -809,14 +804,6 @@ def resize_map_to_output(
         align_corners=False,
     )
     return map_tensor.squeeze(0).squeeze(0).numpy()
-
-
-def build_view_matrix(extrinsic: np.ndarray) -> np.ndarray:
-    view = np.eye(4, dtype=np.float32)
-    view[:3, :3] = extrinsic[:3, :3]
-    view[:3, 3] = extrinsic[:3, 3]
-    conversion = np.diag([1.0, -1.0, -1.0, 1.0]).astype(np.float32)
-    return conversion @ view
 
 
 def ensure_depth_channel(depth_map: np.ndarray) -> np.ndarray:

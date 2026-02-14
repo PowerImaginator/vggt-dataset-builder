@@ -22,6 +22,7 @@ from vggt.models.vggt import VGGT
 from vggt.utils.geometry import unproject_depth_map_to_point_map
 from vggt.utils.load_fn import load_and_preprocess_images
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+from dataset_utils import load_model, build_view_matrix
 try:
     import win32clipboard
     import win32con
@@ -134,12 +135,6 @@ def parse_args() -> argparse.Namespace:
         help="HPR coarse mip level (default: 4).",
     )
     return parser.parse_args()
-
-
-def load_model(device: torch.device) -> VGGT:
-    model = VGGT.from_pretrained("facebook/VGGT-1B").to(device)
-    model.eval()
-    return model
 
 
 def run_vggt(image_paths: list[Path], device: torch.device, preprocess_mode: str):
@@ -477,14 +472,6 @@ def _pil_image_to_clipboard(img: Image.Image) -> None:
         win32clipboard.SetClipboardData(win32con.CF_DIB, data)
     finally:
         win32clipboard.CloseClipboard()
-
-
-def build_view_matrix(extrinsic: np.ndarray) -> np.ndarray:
-    view = np.eye(4, dtype=np.float32)
-    view[:3, :3] = extrinsic[:3, :3]
-    view[:3, 3] = extrinsic[:3, 3]
-    conversion = np.diag([1.0, -1.0, -1.0, 1.0]).astype(np.float32)
-    return conversion @ view
 
 
 def main() -> None:

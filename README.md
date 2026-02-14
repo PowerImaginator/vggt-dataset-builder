@@ -19,6 +19,7 @@ Build warping datasets by rendering VGGT depth point clouds into the next view. 
 ## 📋 Table of Contents
 
 - [Setup](#setup)
+- [Development](#development)
 - [Usage](#usage)
 - [ModelScope LoRA Training Dataset](#modelscope-lora-training-dataset)
 - [AI Toolkit Dataset](#ai-toolkit-dataset)
@@ -26,6 +27,23 @@ Build warping datasets by rendering VGGT depth point clouds into the next view. 
 - [Input Structure](#input-structure)
 - [Output Structure](#output-structure)
 - [Resolution Handling](#resolution-handling)
+
+## Development
+
+**Important:** This project uses `uv` for Python execution. Always run Python code with `uv run`:
+
+```bash
+# ✅ Use this for all Python commands
+uv run python script.py
+uv run pytest tests/
+uv run python build_warp_dataset.py --help
+
+# ❌ Don't use bare python
+python script.py          # Wrong
+python3 script.py         # Wrong
+```
+
+For more details, see [.copilot-instructions.md](.copilot-instructions.md).
 
 ## Setup
 

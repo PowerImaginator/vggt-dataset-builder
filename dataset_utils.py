@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """
-Shared utilities for dataset extraction scripts.
+Shared utilities for dataset extraction and model inference scripts.
 
-This module contains common functions used by multiple dataset extraction
-scripts (aitoolkit-dataset.py, modelscope-dataset.py) to eliminate code duplication.
+This module contains common functions used by multiple scripts including:
+- aitoolkit-dataset.py, modelscope-dataset.py (dataset extraction)
+- build_warp_dataset.py, vggt_point_cloud_viewer.py (model inference)
+
+Functions are organized to eliminate code duplication across the codebase.
 """
 
 import shutil
@@ -11,11 +14,32 @@ from pathlib import Path
 from typing import Callable, Optional
 
 try:
+    import numpy as np
+    HAS_NUMPY = True
+except ImportError:
+    np = None
+    HAS_NUMPY = False
+
+try:
     from PIL import Image
     HAS_PIL = True
 except ImportError:
     Image = None
     HAS_PIL = False
+
+try:
+    import torch
+    HAS_TORCH = True
+except (ImportError, OSError):
+    torch = None
+    HAS_TORCH = False
+
+try:
+    from vggt.models.vggt import VGGT
+    HAS_VGGT = True
+except (ImportError, OSError):
+    VGGT = None
+    HAS_VGGT = False
 
 
 def get_file_extension(pattern_path: Optional[Path]) -> str:
@@ -260,3 +284,68 @@ def extract_dataset_generic(
         print(f"Created {total_triplets} training triplets in {target_base_dir}")
     
     return total_triplets
+
+
+def load_model(device: "torch.device") -> "VGGT":
+    """Load VGGT model for depth estimation.
+    
+    Loads the facebook/VGGT-1B model, moves it to the specified device,
+    and sets it to evaluation mode. This function is used by both
+    build_warp_dataset.py and vggt_point_cloud_viewer.py.
+    
+    Args:
+        device: torch.device to load the model on (e.g., torch.device('cuda') or 'cpu').
+    
+    Returns:
+        VGGT model in evaluation mode on the specified device.
+    
+    Raises:
+        ImportError: If torch or VGGT is not installed.
+    
+    Example:
+        >>> device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        >>> model = load_model(device)
+    """
+    if not HAS_TORCH:
+        raise ImportError("torch and vggt are required for load_model()")
+    
+    model = VGGT.from_pretrained("facebook/VGGT-1B").to(device)
+    model.eval()
+    return model
+
+
+def build_view_matrix(extrinsic: "np.ndarray") -> "np.ndarray":
+    """Build a 4x4 view matrix from extrinsic (camera pose) matrix.
+    
+    Converts an extrinsic camera matrix (rotation + translation) to a view matrix
+    using OpenGL coordinate system conventions. This function is used by both
+    build_warp_dataset.py and vggt_point_cloud_viewer.py for point cloud rendering.
+    
+    The conversion applies:
+    1. Identity + extrinsic orientation and position
+    2. Coordinate system conversion: [1, -1, -1, 1] (RDF to RUB convention)
+    
+    Args:
+        extrinsic: 4x4 extrinsic matrix or 3x4 camera pose matrix.
+                  Should contain rotation in [:3, :3] and translation in [:3, 3].
+    
+    Returns:
+        4x4 view matrix in OpenGL-compatible format (float32).
+    
+    Raises:
+        ImportError: If numpy is not installed.
+    
+    Example:
+        >>> extrinsic = np.eye(4)  # Identity pose
+        >>> view = build_view_matrix(extrinsic)
+        >>> view.shape
+        (4, 4)
+    """
+    if not HAS_NUMPY:
+        raise ImportError("numpy is required for build_view_matrix()")
+    
+    view = np.eye(4, dtype=np.float32)
+    view[:3, :3] = extrinsic[:3, :3]
+    view[:3, 3] = extrinsic[:3, 3]
+    conversion = np.diag([1.0, -1.0, -1.0, 1.0]).astype(np.float32)
+    return conversion @ view
