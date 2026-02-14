@@ -23,7 +23,7 @@ from vggt.utils.geometry import (
 from vggt.utils.load_fn import load_and_preprocess_images
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 from hole_filling_renderer import HoleFillingRenderer
-from dataset_utils import load_model, build_view_matrix
+from dataset_utils import load_model, build_view_matrix, select_device, select_dtype
 
 try:
     import cv2
@@ -1662,13 +1662,8 @@ def main() -> None:
             )
 
     scene_dirs = list_scene_dirs(input_dir)
-    device_name = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    device = torch.device(device_name)
-    dtype = (
-        torch.bfloat16
-        if device.type == "cuda" and torch.cuda.get_device_capability()[0] >= 8
-        else torch.float16
-    )
+    device = select_device(args.device)
+    dtype = select_dtype(device)
 
     model = load_model(device)
     renderer_info = {

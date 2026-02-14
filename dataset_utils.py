@@ -355,3 +355,63 @@ def build_view_matrix(extrinsic: "np.ndarray") -> "np.ndarray":
     view[:3, 3] = extrinsic[:3, 3]
     conversion = np.diag([1.0, -1.0, -1.0, 1.0]).astype(np.float32)
     return conversion @ view
+
+
+def select_device(device_arg: Optional[str] = None) -> "torch.device":
+    """Select torch device based on argument and CUDA availability.
+
+    Provides consistent device selection logic across scripts. If device_arg is None,
+    automatically detects CUDA availability. This function eliminates duplication
+    between build_warp_dataset.py and vggt_point_cloud_viewer.py.
+
+    Args:
+        device_arg: Device string from command-line argument ('cuda', 'cpu', or None).
+                   If None, auto-detects CUDA availability.
+
+    Returns:
+        torch.device object for the selected device.
+
+    Raises:
+        ImportError: If torch is not installed.
+
+    Example:
+        >>> device = select_device(None)  # Auto-detect
+        >>> device = select_device('cuda')  # Force CUDA
+        >>> device = select_device('cpu')  # Force CPU
+    """
+    if not HAS_TORCH:
+        raise ImportError("torch is required for select_device()")
+
+    device_name = device_arg or ("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device(device_name)
+
+
+def select_dtype(device: "torch.device") -> "torch.dtype":
+    """Select appropriate torch dtype based on device capability.
+
+    Selects bfloat16 for CUDA devices with compute capability >= 8.0 (e.g., A100, H100),
+    otherwise uses float16. This provides optimal performance while maintaining
+    compatibility across different GPU generations. Eliminates duplication between
+    build_warp_dataset.py and vggt_point_cloud_viewer.py.
+
+    Args:
+        device: torch.device to check capabilities for.
+
+    Returns:
+        torch.bfloat16 for modern CUDA devices (compute capability >= 8),
+        torch.float16 otherwise.
+
+    Raises:
+        ImportError: If torch is not installed.
+
+    Example:
+        >>> device = torch.device('cuda')
+        >>> dtype = select_dtype(device)
+        >>> # Returns torch.bfloat16 on A100/H100, torch.float16 on older GPUs
+    """
+    if not HAS_TORCH:
+        raise ImportError("torch is required for select_dtype()")
+
+    if device.type == "cuda" and torch.cuda.get_device_capability(device)[0] >= 8:
+        return torch.bfloat16
+    return torch.float16

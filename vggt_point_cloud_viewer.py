@@ -22,7 +22,7 @@ from vggt.models.vggt import VGGT
 from vggt.utils.geometry import unproject_depth_map_to_point_map
 from vggt.utils.load_fn import load_and_preprocess_images
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
-from dataset_utils import load_model, build_view_matrix
+from dataset_utils import load_model, build_view_matrix, select_device, select_dtype
 
 try:
     import win32clipboard
@@ -144,11 +144,7 @@ def run_vggt(image_paths: list[Path], device: torch.device, preprocess_mode: str
     )
     images = images.to(device)
     model_height, model_width = images.shape[-2:]
-    dtype = (
-        torch.bfloat16
-        if device.type == "cuda" and torch.cuda.get_device_capability()[0] >= 8
-        else torch.float16
-    )
+    dtype = select_dtype(device)
 
     model = load_model(device)
     with torch.no_grad():
@@ -493,8 +489,7 @@ def main() -> None:
         missing_text = ", ".join(str(path) for path in missing)
         raise FileNotFoundError(f"Image(s) not found: {missing_text}")
 
-    device_name = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    device = torch.device(device_name)
+    device = select_device(args.device)
 
     depth, depth_conf, extrinsic, intrinsic, colors, model_size = run_vggt(
         args.images, device, args.preprocess_mode

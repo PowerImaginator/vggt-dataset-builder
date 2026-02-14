@@ -16,4 +16,11 @@
 
 **Context:** build_warp_dataset.py and vggt_point_cloud_viewer.py both contained identical `load_model(device)` and `build_view_matrix(extrinsic)` functions. Extracted both to dataset_utils.py with docstrings explaining their use in VGGT depth estimation and point cloud rendering. Reduced 30 lines of duplication; both scripts now import from shared utils. Tests pass; no behavior changes.
 
+## 2026-02-14 - Extract Torch Device and Dtype Selection Utilities
+
+**Learning:** Device and dtype selection logic in PyTorch scripts is small (~7 lines each) but highly repetitive and follows a standard pattern: auto-detect CUDA, select bfloat16 for modern GPUs, fallback to float16. Even though the duplication is modest per-script, centralizing this logic ensures consistency and makes future hardware capability changes trivial to update.
+
+**Action:** Extract small but repetitive patterns when they involve complex conditional logic (like GPU capability detection) or when consistency across scripts matters. Don't dismiss extractions just because they're "only 7 lines"—if those 7 lines contain hardware-specific logic that could change, centralization adds value beyond line-count savings.
+
+**Context:** Both build_warp_dataset.py and vggt_point_cloud_viewer.py duplicated device selection (`device_arg or cuda if available else cpu`) and dtype selection (bfloat16 for compute capability >= 8, else float16). Extracted `select_device()` and `select_dtype()` to dataset_utils.py with comprehensive docstrings. Eliminated 14 lines of duplication across 2 scripts. Benefits: (1) Consistency: all scripts now use identical device/dtype logic, (2) Maintainability: hardware capability logic centralized, (3) Future-proof: new scripts can import these utilities immediately.
 
