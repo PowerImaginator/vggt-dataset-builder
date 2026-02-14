@@ -23,6 +23,7 @@ from vggt.utils.geometry import unproject_depth_map_to_point_map
 from vggt.utils.load_fn import load_and_preprocess_images
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 from dataset_utils import load_model, build_view_matrix
+
 try:
     import win32clipboard
     import win32con
@@ -459,7 +460,9 @@ def _pil_image_to_clipboard(img: Image.Image) -> None:
     if platform.system() != "Windows":
         raise RuntimeError("Clipboard image copy only implemented on Windows")
     if win32clipboard is None or win32con is None:
-        raise RuntimeError("pywin32 is required for clipboard support (install pywin32)")
+        raise RuntimeError(
+            "pywin32 is required for clipboard support (install pywin32)"
+        )
 
     output = io.BytesIO()
     # Save as BMP to get a DIB-compatible byte stream, then strip the 14-byte BMP header
@@ -655,7 +658,9 @@ def main() -> None:
             self.ctx: moderngl.Context | None = None
 
             # Source aspect ratio (point-map width / height) — keep this fixed
-            self.source_aspect = float(self.model_size[0]) / max(float(self.model_size[1]), 1.0)
+            self.source_aspect = float(self.model_size[0]) / max(
+                float(self.model_size[1]), 1.0
+            )
             # Current full-window size (framebuffer) and computed sub-viewport (x,y,w,h)
             self.window_size_current: tuple[int, int] = (width, height)
             self._viewport: tuple[int, int, int, int] = (0, 0, width, height)
@@ -854,7 +859,9 @@ def main() -> None:
         def _init_gl(self):
             gl.glClearColor(0.05, 0.06, 0.07, 1.0)
 
-        def _rotate_vector_around_axis(self, v: np.ndarray, k: np.ndarray, angle_rad: float) -> np.ndarray:
+        def _rotate_vector_around_axis(
+            self, v: np.ndarray, k: np.ndarray, angle_rad: float
+        ) -> np.ndarray:
             # Rodrigues' rotation formula: rotate vector v around axis k (unit) by angle
             k = np.asarray(k, dtype=np.float32)
             v = np.asarray(v, dtype=np.float32)
@@ -866,7 +873,12 @@ def main() -> None:
             s = math.sin(angle_rad)
             return (v * c) + (np.cross(k, v) * s) + (k * (np.dot(k, v) * (1.0 - c)))
 
-        def _compute_intrinsic_preserve_vertical(self, intrinsic: np.ndarray, src_size: tuple[int, int], dst_size: tuple[int, int]) -> np.ndarray:
+        def _compute_intrinsic_preserve_vertical(
+            self,
+            intrinsic: np.ndarray,
+            src_size: tuple[int, int],
+            dst_size: tuple[int, int],
+        ) -> np.ndarray:
             # Keep vertical FOV stable: scale by dst_h / src_h for fx and fy,
             # adjust principal point relative to center so the view expands horizontally when wider.
             if intrinsic is None:
@@ -877,7 +889,9 @@ def main() -> None:
                 fy = dst_h
                 cx = dst_w * 0.5
                 cy = dst_h * 0.5
-                K = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float32)
+                K = np.array(
+                    [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float32
+                )
                 return K
             K = intrinsic.copy().astype(np.float32)
             if K.ndim > 2:
@@ -892,10 +906,14 @@ def main() -> None:
             oy = float(K[1, 2]) - (src_h * 0.5)
             cx = (dst_w * 0.5) + ox * scale
             cy = (dst_h * 0.5) + oy * scale
-            K2 = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float32)
+            K2 = np.array(
+                [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float32
+            )
             return K2
 
-        def _compute_viewport(self, win_w: int, win_h: int) -> tuple[int, int, int, int]:
+        def _compute_viewport(
+            self, win_w: int, win_h: int
+        ) -> tuple[int, int, int, int]:
             # For expand-to-fill behavior we use the full window as the viewport.
             return (0, 0, max(int(win_w), 1), max(int(win_h), 1))
 
@@ -928,7 +946,10 @@ def main() -> None:
                 self.ctx = moderngl.create_context()
             # Determine full framebuffer size or fixed render size
             if self.fixed_render_size is not None:
-                full_size = (int(self.fixed_render_size[0]), int(self.fixed_render_size[1]))
+                full_size = (
+                    int(self.fixed_render_size[0]),
+                    int(self.fixed_render_size[1]),
+                )
             else:
                 full_size = self.get_framebuffer_size()
             # Compute a centered sub-viewport that preserves the source aspect
@@ -964,7 +985,11 @@ def main() -> None:
             if self.render_size is None:
                 # ensure renderer and viewport are set
                 self._ensure_renderer()
-            render_width, render_height = self.render_size if self.render_size is not None else self.get_framebuffer_size()
+            render_width, render_height = (
+                self.render_size
+                if self.render_size is not None
+                else self.get_framebuffer_size()
+            )
             vp_x, vp_y, vp_w, vp_h = self._viewport
 
             # Preserve vertical FOV: compute intrinsic scaled by render height
@@ -975,7 +1000,11 @@ def main() -> None:
             )
 
             proj = projection_from_intrinsic(
-                base_intrinsic if base_intrinsic is not None else None, render_width, render_height, near, far
+                base_intrinsic if base_intrinsic is not None else None,
+                render_width,
+                render_height,
+                near,
+                far,
             )
             # compute vertical fov using fy
             if base_intrinsic is None:
@@ -996,7 +1025,9 @@ def main() -> None:
             # compute up vector with roll applied around the forward axis
             up = self.world_up
             if abs(self.roll) > 1e-6:
-                up = self._rotate_vector_around_axis(up, forward, math.radians(self.roll))
+                up = self._rotate_vector_around_axis(
+                    up, forward, math.radians(self.roll)
+                )
             view = look_at(
                 self.camera_pos,
                 self.camera_pos + forward,
@@ -1008,12 +1039,16 @@ def main() -> None:
             # Prefer direct GPU rendering when the renderer supports it
             if hasattr(self.renderer, "render_to_screen"):
                 try:
-                    self.renderer.render_to_screen(self.vertices, colors, self.confidences, view, proj, fov_y)
+                    self.renderer.render_to_screen(
+                        self.vertices, colors, self.confidences, view, proj, fov_y
+                    )
                 except Exception as e:
                     print(f"[viewer] render_to_screen failed: {e}")
             else:
                 # Fallback to CPU render+blit
-                frame = self.renderer.render(self.vertices, colors, self.confidences, view, proj, fov_y)
+                frame = self.renderer.render(
+                    self.vertices, colors, self.confidences, view, proj, fov_y
+                )
                 try:
                     frame = np.ascontiguousarray(frame)
                     # Diagnostics to help debug blank/flash: log min/max/mean
@@ -1021,12 +1056,18 @@ def main() -> None:
                         fmin = int(frame.min())
                         fmax = int(frame.max())
                         fmean = float(frame.mean())
-                        print(f"[viewer] rendered frame shape={frame.shape} min={fmin} max={fmax} mean={fmean:.2f}")
+                        print(
+                            f"[viewer] rendered frame shape={frame.shape} min={fmin} max={fmax} mean={fmean:.2f}"
+                        )
                     except Exception:
-                        print(f"[viewer] rendered frame shape={getattr(frame, 'shape', None)}; cannot compute stats")
+                        print(
+                            f"[viewer] rendered frame shape={getattr(frame, 'shape', None)}; cannot compute stats"
+                        )
                     # Flip vertically for correct orientation when blitting
                     frame_flip = np.ascontiguousarray(np.flipud(frame))
-                    img = pyglet.image.ImageData(vp_w, vp_h, 'RGB', frame_flip.tobytes(), pitch=vp_w * 3)
+                    img = pyglet.image.ImageData(
+                        vp_w, vp_h, "RGB", frame_flip.tobytes(), pitch=vp_w * 3
+                    )
                     # Blit into the computed viewport origin to keep letterboxing/pillarboxing
                     img.blit(vp_x, vp_y)
                 except Exception as e:
@@ -1149,10 +1190,16 @@ def main() -> None:
             try:
                 if scroll_y > 0:
                     self.move_state["forward"] = True
-                    pyglet.clock.schedule_once(lambda dt: self._clear_move_state("forward"), 0.12 * float(scroll_y))
+                    pyglet.clock.schedule_once(
+                        lambda dt: self._clear_move_state("forward"),
+                        0.12 * float(scroll_y),
+                    )
                 elif scroll_y < 0:
                     self.move_state["backward"] = True
-                    pyglet.clock.schedule_once(lambda dt: self._clear_move_state("backward"), 0.12 * float(abs(scroll_y)))
+                    pyglet.clock.schedule_once(
+                        lambda dt: self._clear_move_state("backward"),
+                        0.12 * float(abs(scroll_y)),
+                    )
             except Exception:
                 pass
 
@@ -1195,12 +1242,9 @@ def main() -> None:
 
             # Ctrl+C (or Cmd+C on macOS) -> copy current render to clipboard
             try:
-                is_copy = (
-                    symbol == pyglet.window.key.C
-                    and (
-                        (modifiers & pyglet.window.key.MOD_CTRL) != 0
-                        or (modifiers & getattr(pyglet.window.key, "MOD_COMMAND", 0)) != 0
-                    )
+                is_copy = symbol == pyglet.window.key.C and (
+                    (modifiers & pyglet.window.key.MOD_CTRL) != 0
+                    or (modifiers & getattr(pyglet.window.key, "MOD_COMMAND", 0)) != 0
                 )
             except Exception:
                 is_copy = False
@@ -1296,7 +1340,9 @@ def main() -> None:
             maxw = 0
             labels_info = []
             for idx, (txt, _) in enumerate(items):
-                lbl = pyglet.text.Label(txt, anchor_x="left", anchor_y="top", font_size=12)
+                lbl = pyglet.text.Label(
+                    txt, anchor_x="left", anchor_y="top", font_size=12
+                )
                 w = getattr(lbl, "content_width", len(txt) * 8)
                 maxw = max(maxw, w)
                 labels_info.append((txt, w))
@@ -1319,13 +1365,17 @@ def main() -> None:
             from pyglet import shapes
 
             # Background (pyglet shapes use bottom-left origin)
-            bg = shapes.Rectangle(ox, oy - box_h, box_w, box_h, color=(40, 40, 40), batch=batch)
+            bg = shapes.Rectangle(
+                ox, oy - box_h, box_w, box_h, color=(40, 40, 40), batch=batch
+            )
 
             # Hover highlight
             hover_idx = getattr(self, "context_menu_hover_index", -1)
             if 0 <= hover_idx < len(items):
                 hy_y = oy - (hover_idx + 1) * item_h
-                hover_rect = shapes.Rectangle(ox, hy_y, box_w, item_h, color=(70, 70, 70), batch=batch)
+                hover_rect = shapes.Rectangle(
+                    ox, hy_y, box_w, item_h, color=(70, 70, 70), batch=batch
+                )
 
             # Labels
             # vertical padding inside each item

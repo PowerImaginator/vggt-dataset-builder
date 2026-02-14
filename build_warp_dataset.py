@@ -53,6 +53,7 @@ SUPPORTED_EXTENSIONS = {
 CACHE_DIR = Path(__file__).resolve().parent / ".cache"
 MODEL_ID = "facebook/VGGT-1B"
 
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Build a warping dataset by rendering VGGT depth point clouds into the next view."
@@ -899,7 +900,9 @@ def _image_signature(path: Path) -> str:
         return ""
 
 
-def _make_args_hash(args: argparse.Namespace, resize_size: tuple[int, int] | None) -> str:
+def _make_args_hash(
+    args: argparse.Namespace, resize_size: tuple[int, int] | None
+) -> str:
     key = {
         "preprocess_mode": args.preprocess_mode,
         "max_megapixels": float(args.max_megapixels),
@@ -960,7 +963,9 @@ def load_frame_cache(cache_path: Path) -> dict | None:
         if "s0" in data:
             frame_data["s0"] = float(data["s0"].tolist())
         if "conf_image" in data:
-            frame_data["conf_image"] = Image.fromarray(data["conf_image"].astype(np.uint8))
+            frame_data["conf_image"] = Image.fromarray(
+                data["conf_image"].astype(np.uint8)
+            )
         return frame_data
     except Exception:
         return None
@@ -1018,8 +1023,6 @@ def check_scene_needs_processing(
                     manifest_images = {}
         except Exception:
             manifest_images = {}
-
-    
 
     for idx in range(len(image_paths) - 1):
         next_idx = idx + 1
@@ -1358,7 +1361,11 @@ def process_scene(
         intrinsic_render_batch = []
         intrinsic_unproject_batch = []
         for idx, meta in enumerate(preprocess_metas):
-            intri_render = intrinsic_for_output(intrinsic[idx], meta, output_size if args.upsample_depth else resize_size)
+            intri_render = intrinsic_for_output(
+                intrinsic[idx],
+                meta,
+                output_size if args.upsample_depth else resize_size,
+            )
             intrinsic_render_batch.append(intri_render)
             if args.upsample_depth:
                 intrinsic_unproject_batch.append(intri_render)
@@ -1718,7 +1725,6 @@ def main() -> None:
             output_dir,
             resize_size,
         )
-
 
 
 if __name__ == "__main__":
