@@ -38,6 +38,8 @@ python tests/test_triplet_detection.py
 
 - **test_triplet_detection.py** - Tests for triplet detection logic. Verifies that complete image triplets (splats, reference, target) are correctly identified in scene directories.
 
+- **test_validate_image.py** - Tests for image validation utilities. Verifies that corrupted, truncated, empty, and invalid image files are properly detected and rejected during dataset preparation. Covers critical error paths to prevent bad images from entering the training pipeline.
+
 ## Adding New Tests
 
 1. Create a new test file in this directory following the naming convention `test_*.py`
