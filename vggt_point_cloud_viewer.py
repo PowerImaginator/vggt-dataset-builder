@@ -11,18 +11,22 @@ import sys
 import io
 import platform
 
-# Ensure local `vggt/` package is importable when running the script directly
-_repo_root = Path(__file__).resolve().parent
-_vggt_path = str(_repo_root / "vggt")
-if _vggt_path not in sys.path:
-    sys.path.insert(0, _vggt_path)
-
 from hole_filling_renderer import HoleFillingRenderer
+from dataset_utils import (
+    load_model,
+    build_view_matrix,
+    select_device,
+    select_dtype,
+    setup_vggt_path,
+)
+
+# Ensure local vggt/ submodule is importable
+setup_vggt_path()
+
 from vggt.models.vggt import VGGT
 from vggt.utils.geometry import unproject_depth_map_to_point_map
 from vggt.utils.load_fn import load_and_preprocess_images
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
-from dataset_utils import load_model, build_view_matrix, select_device, select_dtype
 
 try:
     import win32clipboard

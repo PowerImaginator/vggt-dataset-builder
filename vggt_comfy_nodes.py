@@ -5,10 +5,10 @@ import torch.nn.functional as F
 import sys
 from pathlib import Path
 
-# Add vggt to path
-vggt_path = str(Path(__file__).parent / "vggt")
-if vggt_path not in sys.path:
-    sys.path.insert(0, vggt_path)
+from dataset_utils import setup_vggt_path
+
+# Ensure local vggt/ submodule is importable
+setup_vggt_path()
 
 # Import VGGT utilities
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri

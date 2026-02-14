@@ -5,8 +5,16 @@ import sys
 import tempfile
 from pathlib import Path
 
-# Add the vggt submodule to the path so its internal imports work
-sys.path.insert(0, str(Path(__file__).parent / "vggt"))
+from dataset_utils import (
+    load_model,
+    build_view_matrix,
+    select_device,
+    select_dtype,
+    setup_vggt_path,
+)
+
+# Ensure local vggt/ submodule is importable
+setup_vggt_path()
 
 import numpy as np
 import torch

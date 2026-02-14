@@ -10,6 +10,7 @@ Functions are organized to eliminate code duplication across the codebase.
 """
 
 import shutil
+import sys
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -44,6 +45,31 @@ try:
 except (ImportError, OSError):
     VGGT = None
     HAS_VGGT = False
+
+
+def setup_vggt_path() -> None:
+    """Add the local vggt submodule to sys.path for imports to work.
+
+    Ensures that when a script imports VGGT components (e.g., 'from vggt.models.vggt import VGGT'),
+    the local vggt/ submodule directory is in the search path. This function is idempotent
+    (safe to call multiple times) and thread-safe.
+
+    This utility eliminates code duplication across scripts that all need to set up
+    the vggt module path:
+    - build_warp_dataset.py
+    - vggt_point_cloud_viewer.py
+    - vggt_comfy_nodes.py
+
+    Returns:
+        None
+
+    Example:
+        >>> setup_vggt_path()
+        >>> from vggt.models.vggt import VGGT  # This will now work
+    """
+    vggt_path = str(Path(__file__).parent / "vggt")
+    if vggt_path not in sys.path:
+        sys.path.insert(0, vggt_path)
 
 
 def get_file_extension(pattern_path: Optional[Path]) -> str:
@@ -313,9 +339,19 @@ def load_model(device: "torch.device") -> "VGGT":
         >>> model = load_model(device)
     """
     if not HAS_TORCH:
-        raise ImportError("torch and vggt are required for load_model()")
+        raise ImportError("torch is required for load_model()")
 
-    model = VGGT.from_pretrained("facebook/VGGT-1B").to(device)
+    # Lazy import VGGT in case the module-level import failed due to path issues
+    # This allows setup_vggt_path() to be called first by the user script
+    try:
+        from vggt.models.vggt import VGGT as VGGT_Model
+    except (ImportError, OSError) as e:
+        raise ImportError(
+            f"VGGT model unavailable. Make sure setup_vggt_path() was called first "
+            f"and VGGT library is installed. Error: {e}"
+        ) from e
+
+    model = VGGT_Model.from_pretrained("facebook/VGGT-1B").to(device)
     model.eval()
     return model
 
