@@ -722,6 +722,7 @@ def restore_map_to_original_resolution(
     mode: str,
     *,
     fill_value: float = 0.0,
+    target_size: tuple[int, int] | None = None,
 ) -> np.ndarray:
     map_tensor = torch.from_numpy(model_map).unsqueeze(0).unsqueeze(0)
     left = int(meta["total_pad_left"])
@@ -744,9 +745,15 @@ def restore_map_to_original_resolution(
         canvas[:, :, crop_top : crop_top + cropped_height, :cropped_width] = map_tensor
         map_tensor = canvas
 
+    # ⚡ Bolt: Use target_size if provided to avoid redundant second interpolation
+    interp_size = (
+        (target_size[1], target_size[0])
+        if target_size
+        else (int(meta["orig_height"]), int(meta["orig_width"]))
+    )
     map_tensor = torch_nn.interpolate(
         map_tensor,
-        size=(int(meta["orig_height"]), int(meta["orig_width"])),
+        size=interp_size,
         mode="bilinear",
         align_corners=False,
     )
@@ -1106,7 +1113,8 @@ def render_and_save_pair(
     output_ext: str,
     save_kwargs: dict,
     args: argparse.Namespace,
-    frame_data: dict,
+    source_frame_data: dict,
+    target_frame_data: dict,
     extrinsic_batch: np.ndarray,
     intrinsic_render_batch: list[np.ndarray],
     preprocess_metas: list[dict],
@@ -1141,10 +1149,10 @@ def render_and_save_pair(
         return
 
     # ⚡ Bolt: Use pre-calculated frame data to avoid redundant filtering and extraction
-    points = frame_data["points"]
-    colors = frame_data["colors"]
-    confidences = frame_data["confidences"]
-    s0 = frame_data.get("s0", 0.0)
+    points = source_frame_data["points"]
+    colors = source_frame_data["colors"]
+    confidences = source_frame_data["confidences"]
+    s0 = source_frame_data.get("s0", 0.0)
 
     if args.auto_s0 and s0 > 0.0:
         renderer.s0 = s0
@@ -1170,44 +1178,64 @@ def render_and_save_pair(
         Image.fromarray(splats_image).save(splats_path, **save_kwargs)
 
     if args.save_confidence and not conf_path.exists():
-        # ⚡ Bolt: Use pre-calculated confidence image
-        conf_image = frame_data.get("conf_image")
+        # ⚡ Bolt: Use pre-calculated confidence image from target frame
+        conf_image = target_frame_data.get("conf_image")
         if conf_image is not None:
             # Always save confidence as PNG for lossless grayscale
             conf_image.save(conf_path)
 
-    if not target_path.exists() or not reference_path.exists():
-        # ⚡ Bolt: Reuse cached images from frame_data when available to avoid
-        # redundant disk I/O and resize operations (up to 50% faster with --upsample-depth).
-        target_img_obj = frame_data.get("img_cached")
+    # ⚡ Bolt: Handle target and reference images only when actually missing
+    # and reuse cached PIL images when available to avoid redundant disk I/O.
+    if not target_path.exists():
+        target_img_obj = target_frame_data.get("img_cached")
         should_close_target = True
 
         if target_img_obj is None:
             target_img_obj = Image.open(image_paths[target_idx])
             target_img_obj = target_img_obj.convert("RGB")
-            if resize_size is not None:
+            # Ensure image size matches the splats resolution
+            if (
+                args.upsample_depth or resize_size is not None
+            ) and target_img_obj.size != (
+                render_width,
+                render_height,
+            ):
                 target_img_obj = target_img_obj.resize(
-                    resize_size, Image.Resampling.BICUBIC
+                    (render_width, render_height), Image.Resampling.BICUBIC
                 )
         else:
             should_close_target = False
 
-        reference_img_obj = Image.open(image_paths[source_idx])
-        reference_img_obj = reference_img_obj.convert("RGB")
-        if resize_size is not None:
-            reference_img_obj = reference_img_obj.resize(
-                resize_size, Image.Resampling.BICUBIC
-            )
-
         try:
-            if not target_path.exists():
-                target_img_obj.save(target_path, **save_kwargs)
-            if not reference_path.exists():
-                reference_img_obj.save(reference_path, **save_kwargs)
+            target_img_obj.save(target_path, **save_kwargs)
         finally:
             if should_close_target and target_img_obj is not None:
                 target_img_obj.close()
-            if reference_img_obj is not None:
+
+    if not reference_path.exists():
+        reference_img_obj = source_frame_data.get("img_cached")
+        should_close_reference = True
+
+        if reference_img_obj is None:
+            reference_img_obj = Image.open(image_paths[source_idx])
+            reference_img_obj = reference_img_obj.convert("RGB")
+            # Ensure image size matches the splats resolution
+            if (
+                args.upsample_depth or resize_size is not None
+            ) and reference_img_obj.size != (
+                render_width,
+                render_height,
+            ):
+                reference_img_obj = reference_img_obj.resize(
+                    (render_width, render_height), Image.Resampling.BICUBIC
+                )
+        else:
+            should_close_reference = False
+
+        try:
+            reference_img_obj.save(reference_path, **save_kwargs)
+        finally:
+            if should_close_reference and reference_img_obj is not None:
                 reference_img_obj.close()
 
     # Save PLY file if requested
@@ -1444,11 +1472,37 @@ def process_scene(
             except Exception:
                 manifest_images = {}
 
+        # ⚡ Bolt: Identify missing triplets and only pre-calculate frames that are needed.
+        # This significantly speeds up resuming interrupted runs.
+        def is_triplet_missing(t_idx):
+            t_name = image_paths[t_idx].stem
+            t_paths = get_triplet_paths(scene_output_dir, t_name, output_ext)
+            return (
+                args.force_output
+                or not t_paths["splats"].exists()
+                or not t_paths["target"].exists()
+                or not t_paths["reference"].exists()
+                or (args.save_confidence and not t_paths["confidence"].exists())
+                or (args.save_ply and not t_paths["ply"].exists())
+            )
+
+        needed_frames = set()
+        for idx in range(len(image_paths) - 1):
+            if is_triplet_missing(idx + 1):
+                needed_frames.add(idx)
+                needed_frames.add(idx + 1)
+            if args.bidirectional and is_triplet_missing(idx):
+                needed_frames.add(idx)
+                needed_frames.add(idx + 1)
+
         # ⚡ Bolt: Pre-calculate and cache filtered point cloud data once per frame.
         # This avoids redundant expensive extraction and filtering in the rendering loop.
-        frame_data_cache = []
-        print(f"Pre-calculating point cloud data for {len(image_paths)} frames...")
-        for idx in range(len(image_paths)):
+        frame_data_cache = [None] * len(image_paths)
+        if needed_frames:
+            print(
+                f"Pre-calculating point cloud data for {len(needed_frames)}/{len(image_paths)} frames..."
+            )
+        for idx in sorted(list(needed_frames)):
             # Try to load cached frame data first (unless forced/nocache)
             cache_path = _cache_file_for_image(scene_cache_dir, image_paths[idx])
             if cache_enabled and not args.force_output and cache_path.exists():
@@ -1459,7 +1513,7 @@ def process_scene(
                     if cached_sig == sig:
                         cached = load_frame_cache(cache_path)
                         if cached is not None:
-                            frame_data_cache.append(cached)
+                            frame_data_cache[idx] = cached
                             continue
                 except Exception:
                     pass
@@ -1479,15 +1533,18 @@ def process_scene(
             meta = preprocess_metas[idx]
 
             if args.upsample_depth:
-                # Perform upsampling only when needed
+                # ⚡ Bolt: Perform upsampling directly to output resolution
+                # to avoid redundant interpolation passes.
                 depth_frame = restore_map_to_original_resolution(
-                    depth_frame, meta, args.preprocess_mode
+                    depth_frame, meta, args.preprocess_mode, target_size=output_size
                 )
                 conf_frame = restore_map_to_original_resolution(
-                    conf_frame, meta, args.preprocess_mode, fill_value=0.0
+                    conf_frame,
+                    meta,
+                    args.preprocess_mode,
+                    fill_value=0.0,
+                    target_size=output_size,
                 )
-                depth_frame = resize_map_to_output(depth_frame, output_size)
-                conf_frame = resize_map_to_output(conf_frame, output_size)
 
             # Apply sky filtering if enabled
             if args.filter_sky and skyseg_session is not None:
@@ -1513,14 +1570,16 @@ def process_scene(
                     img = img.convert("RGB")
                     if img.size != output_size:
                         img = img.resize(output_size, Image.Resampling.BICUBIC)
-                    colors_frame = np.array(img, dtype=np.float32) / 255.0
                     # Cache the resized PIL image for later use in render_and_save_pair
                     img_cached = img.copy()
+                    # ⚡ Bolt: Extract colors sparsely from uint8 array to save memory
+                    # and avoid redundant float32 conversions for the entire image.
+                    img_np = np.array(img)  # uint8 (H, W, 3)
+                    colors = img_np[valid_mask].astype(np.float32) / 255.0
             else:
                 colors_frame = images_small_np[idx]
+                colors = colors_frame[valid_mask]
                 img_cached = None
-
-            colors = colors_frame[valid_mask]
             confidences = conf_frame[valid_mask]
 
             # Apply background filtering if enabled
@@ -1594,7 +1653,7 @@ def process_scene(
                 except Exception:
                     pass
 
-            frame_data_cache.append(frame_data)
+            frame_data_cache[idx] = frame_data
             # Explicitly clear temporary frame data to keep peak memory low
             del depth_frame
             del conf_frame
@@ -1615,34 +1674,19 @@ def process_scene(
             next_idx = idx + 1
 
             # Forward: idx -> next_idx
-            render_and_save_pair(
-                idx,
-                next_idx,
-                image_paths,
-                scene_output_dir,
-                output_ext,
-                save_kwargs,
-                args,
-                frame_data_cache[idx],
-                extrinsic,
-                intrinsic_render_batch,
-                preprocess_metas,
-                renderer,
-                render_width,
-                render_height,
-                resize_size,
-            )
-
-            # Reverse: next_idx -> idx
-            if args.bidirectional:
+            if (
+                frame_data_cache[idx] is not None
+                and frame_data_cache[next_idx] is not None
+            ):
                 render_and_save_pair(
-                    next_idx,
                     idx,
+                    next_idx,
                     image_paths,
                     scene_output_dir,
                     output_ext,
                     save_kwargs,
                     args,
+                    frame_data_cache[idx],
                     frame_data_cache[next_idx],
                     extrinsic,
                     intrinsic_render_batch,
@@ -1652,6 +1696,54 @@ def process_scene(
                     render_height,
                     resize_size,
                 )
+
+            # Reverse: next_idx -> idx
+            if args.bidirectional:
+                if (
+                    frame_data_cache[idx] is not None
+                    and frame_data_cache[next_idx] is not None
+                ):
+                    render_and_save_pair(
+                        next_idx,
+                        idx,
+                        image_paths,
+                        scene_output_dir,
+                        output_ext,
+                        save_kwargs,
+                        args,
+                        frame_data_cache[next_idx],
+                        frame_data_cache[idx],
+                        extrinsic,
+                        intrinsic_render_batch,
+                        preprocess_metas,
+                        renderer,
+                        render_width,
+                        render_height,
+                        resize_size,
+                    )
+
+            # ⚡ Bolt: Clear cached images from frame_data no longer needed to save memory
+            # once the current frame has been processed as both source and target.
+            if frame_data_cache[idx] is not None:
+                if "img_cached" in frame_data_cache[idx]:
+                    if hasattr(frame_data_cache[idx]["img_cached"], "close"):
+                        frame_data_cache[idx]["img_cached"].close()
+                    del frame_data_cache[idx]["img_cached"]
+                if "conf_image" in frame_data_cache[idx]:
+                    if hasattr(frame_data_cache[idx]["conf_image"], "close"):
+                        frame_data_cache[idx]["conf_image"].close()
+                    del frame_data_cache[idx]["conf_image"]
+
+        # Clear the very last frame's cached images
+        if frame_data_cache[-1] is not None:
+            if "img_cached" in frame_data_cache[-1]:
+                if hasattr(frame_data_cache[-1]["img_cached"], "close"):
+                    frame_data_cache[-1]["img_cached"].close()
+                del frame_data_cache[-1]["img_cached"]
+            if "conf_image" in frame_data_cache[-1]:
+                if hasattr(frame_data_cache[-1]["conf_image"], "close"):
+                    frame_data_cache[-1]["conf_image"].close()
+                del frame_data_cache[-1]["conf_image"]
 
         # Explicit cleanup
         del images
